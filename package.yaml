@@ -7,6 +7,8 @@ github: doublecrowngaming/dataflower
 
 ghc-options: -Wall -O2
 
+language: Haskell2010
+
 default-extensions:
 - StrictData
 

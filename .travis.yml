@@ -15,6 +15,7 @@ env:
 - ARGS="--resolver lts-13"
 - ARGS="--resolver lts-14"
 - ARGS="--resolver lts-15"
+- ARGS="--resolver lts-20"
 
 before_install:
 - mkdir -p ~/.local/bin
