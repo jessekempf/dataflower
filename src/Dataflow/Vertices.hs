@@ -1,4 +1,3 @@
-{-# LANGUAGE OverloadedLists     #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
 module Dataflow.Vertices (
