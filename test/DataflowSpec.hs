@@ -55,7 +55,7 @@ storeAndForward next = statefulVertex [] store forward
   where
     store sref _ i = modifyState sref (i :)
     forward sref t = do
-      mapM_ (send next t) =<< reverse <$> readState sref
+      mapM_ (send next t) . reverse =<< readState sref
       writeState sref []
 
 integrate :: Edge Int -> Dataflow (Edge Int)
