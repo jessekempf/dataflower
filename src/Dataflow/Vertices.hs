@@ -4,8 +4,7 @@ module Dataflow.Vertices (
   statefulVertex,
   statelessVertex,
   outputTVar,
-  trace,
-  discard
+  trace
 ) where
 
 import           Control.Concurrent.STM.TVar (TVar, modifyTVar')

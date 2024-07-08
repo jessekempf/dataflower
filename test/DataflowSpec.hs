@@ -67,3 +67,6 @@ integrate next = statefulVertex 0 recv finalize
       send next t =<< readState s
 
     finalize _ _ = return ()
+
+discard :: Dataflow (Edge i)
+discard = statelessVertex $ \_ _ -> return ()
