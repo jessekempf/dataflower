@@ -2,6 +2,10 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE MultiParamTypeClasses      #-}
 {-# LANGUAGE RecordWildCards            #-}
+{-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE RecursiveDo #-}
+{-# LANGUAGE InstanceSigs #-}
 
 module Dataflow.Primitives (
   Dataflow(..),
@@ -15,19 +19,27 @@ module Dataflow.Primitives (
   writeState,
   modifyState,
   Edge,
+  Egress,
+  Feedback,
   Epoch(..),
   Timestamp(..),
   inc,
   registerVertex,
   input,
   send,
-  finalize
+  finalize,
+  loop,
+  egress,
+  finalizeEgress,
+  feedback,
+  finalizeFeedback,
 ) where
 
 import           Control.Arrow              ((>>>))
 import           Control.Monad              (forM, (>=>))
 import           Control.Monad.IO.Class     (liftIO)
-import           Control.Monad.State.Strict (StateT, get, gets, modify)
+import Control.Monad.Fix (MonadFix)
+import           Control.Monad.State.Strict (StateT, get, gets, modify, MonadFix (..))
 import           Control.Monad.Trans        (lift)
 import           Data.Hashable              (Hashable (..))
 import           Data.IORef                 (IORef, modifyIORef', newIORef,
@@ -37,17 +49,21 @@ import           GHC.Exts                   (Any)
 import           Numeric.Natural            (Natural)
 import           Prelude
 import           Unsafe.Coerce              (unsafeCoerce)
-import Debug.Trace (traceM, trace)
+import Data.Vector.Generic.New (run)
 
 
 newtype VertexID    = VertexID        Int deriving (Eq, Ord, Show)
 newtype StateID     = StateID         Int deriving (Eq, Ord, Show)
 newtype Epoch       = Epoch       Natural deriving (Eq, Ord, Hashable, Show)
-
+newtype LoopCounter = LoopCounter Natural deriving (Eq, Ord, Hashable, Show)
 -- | 'Timestamp's represent instants in the causal timeline.
 --
 -- @since 0.1.0.0
-newtype Timestamp   = Timestamp     Epoch deriving (Eq, Ord, Hashable, Show)
+data Timestamp   = Timestamp     Epoch [LoopCounter] deriving (Eq, Ord, Show)
+
+instance Hashable Timestamp where
+  hashWithSalt salt (Timestamp epoch counters) = hashWithSalt salt epoch ^ hashWithSalt salt counters
+
 
 -- | An 'Edge' is a typed reference to a computational vertex that
 -- takes 'a's as its input.
@@ -68,6 +84,8 @@ instance Incrementable StateID where
 instance Incrementable Epoch where
   inc (Epoch n) = Epoch (n + 1)
 
+instance Incrementable LoopCounter where
+  inc (LoopCounter n) = LoopCounter (n + 1)
 
 data DataflowState = DataflowState {
   dfsVertices       :: Vector Any,
@@ -106,6 +124,7 @@ data Vertex i =
       (StateRef s)
       (StateRef s -> Timestamp -> i -> Dataflow ())
       (StateRef s -> Timestamp -> Dataflow())
+  | LoopContext    (Nested (Edge i))
   | StatelessVertex
       (Timestamp -> i -> Dataflow ())
       (Timestamp -> Dataflow ())
@@ -203,8 +222,12 @@ send :: Edge input -> Timestamp -> input -> Dataflow ()
 send e t i = lookupVertex e >>= invoke t i
   where
     invoke timestamp datum (StatefulVertex sref callback _) = callback sref timestamp datum
+    invoke timestamp datum (LoopContext defineLoop) = do
+      loopInput <- runNested defineLoop
+      send loopInput (nestLoop timestamp) datum
     invoke timestamp datum (StatelessVertex callback _)     = callback timestamp datum
 
+    nestLoop (Timestamp epoch lcs) = Timestamp epoch (LoopCounter 0 : lcs)
 -- Notify all relevant vertices that no more input is coming for `Timestamp`.
 --
 -- @since 0.1.0.0
@@ -212,4 +235,45 @@ finalize :: Edge i -> Timestamp -> Dataflow ()
 finalize e t = lookupVertex e >>= invoke t
   where
     invoke timestamp (StatefulVertex sref _ finalizer) = finalizer sref timestamp
+    invoke timestamp (LoopContext defineLoop) = do
+      loopInput <- runNested defineLoop
+      finalize loopInput timestamp
     invoke timestamp (StatelessVertex _ finalizer) = finalizer timestamp
+
+newtype Feedback a = Feedback (Edge a)
+newtype Egress a = Egress (Edge a)
+newtype Nested a = Nested { runNested ::  Dataflow a } deriving (Functor, Applicative, Monad)
+
+instance MonadFix Nested where
+  mfix :: (a -> Nested a) -> Nested a
+  mfix execute = Nested $ Dataflow $ mfix (runDataflow . runNested . execute)
+
+
+{-# INLINE feedback #-}
+{-# ANN feedback "HLint: ignore Eta reduce" #-}
+feedback :: Feedback feedback -> Timestamp -> feedback -> Dataflow ()
+feedback (Feedback f) t datum = send f (incLoopCounter t) datum
+  where
+    incLoopCounter (Timestamp _ []) = error "programming error: incrementing non-existent loop counter"
+    incLoopCounter (Timestamp e (counter : lcs)) = Timestamp e (inc counter : lcs)
+
+finalizeFeedback :: Feedback feedback -> Timestamp -> Dataflow ()
+finalizeFeedback (Feedback f) = finalize f
+
+{-# INLINE egress #-}
+{-# ANN egress "HLint: ignore Eta reduce" #-}
+egress :: Egress o -> Timestamp -> o -> Dataflow ()
+egress (Egress o) t datum = send o (unnestLoop t) datum
+  where
+    unnestLoop (Timestamp _ []) = error "programming error: unnesting non-nested timestamp"
+    unnestLoop (Timestamp e (_ : lcs)) = Timestamp e lcs
+
+finalizeEgress :: Egress o -> Timestamp -> Dataflow ()
+finalizeEgress (Egress o) = finalize o
+
+loop :: (Egress o -> Feedback i -> Dataflow (Edge i)) -> Edge o -> Dataflow (Edge i)
+loop nestedFlow out =
+  registerVertex $ LoopContext (mdo
+    input <- Nested $ nestedFlow (Egress out) (Feedback input)
+    return input
+  )

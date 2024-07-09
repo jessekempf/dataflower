@@ -10,7 +10,7 @@ module Dataflow.Vertices (
 import           Control.Concurrent.STM.TVar (TVar, modifyTVar')
 import           Control.Monad.STM           (atomically)
 import           Control.Monad.Trans.Class   (lift)
-import           Dataflow.Primitives         (Dataflow (..), Edge, StateRef,
+import           Dataflow.Primitives         (Dataflow (..), Edge, StateRef, 
                                               Timestamp (..), Vertex (..),
                                               newState,
                                               registerVertex, send, finalize)

@@ -50,6 +50,17 @@ spec = do
     it "discards all input" $ property $
       \(numbers :: [Int]) -> runDataflow discard numbers `shouldReturn` ([] :: [()])
 
+  describe "loop" $
+    it "loops" $ do
+      runDataflow (loop (feedbackCeiling 5)) [1, 2, 3, 4, 5, 6]
+        `shouldReturn` [5, 5, 5, 5, 5, 10]
+
+feedbackCeiling :: Int -> Egress Int -> Feedback Int -> Dataflow (Edge Int)
+feedbackCeiling ceil e f =
+  statelessVertex (\t (i :: Int) ->
+    if i `mod` ceil == 0 then egress e t i else feedback f t (i + 1)
+  ) (finalizeFeedback f >> finalizeEgress e)
+
 storeAndForward :: Edge i -> Dataflow (Edge i)
 storeAndForward next = statefulVertex [] store forward
   where

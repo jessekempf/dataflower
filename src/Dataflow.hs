@@ -18,6 +18,13 @@ module Dataflow (
   StateRef,
   send,
   finalize,
+  loop,
+  Egress,
+  egress,
+  finalizeEgress,
+  Feedback,
+  feedback,
+  finalizeFeedback,
   readState,
   writeState,
   modifyState,
@@ -66,4 +73,4 @@ execute corpus Program{..} = liftIO $ do
 
   return $ Program programInput (inc programEpoch) newProgramState
   where
-    timestamp = Timestamp programEpoch
+    timestamp = Timestamp programEpoch []
