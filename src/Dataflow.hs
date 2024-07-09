@@ -17,6 +17,7 @@ module Dataflow (
   Timestamp,
   StateRef,
   send,
+  finalize,
   readState,
   writeState,
   modifyState,
@@ -42,6 +43,7 @@ import           Dataflow.Vertices
 -- @since 0.1.0.0
 data Program i = Program {
   programInput :: Edge i,
+  programEpoch :: Epoch,
   programState :: DataflowState
 }
 
@@ -49,7 +51,9 @@ data Program i = Program {
 --
 -- @since 0.1.0.0
 compile :: MonadIO io => Dataflow (Edge i) -> io (Program i)
-compile (Dataflow actions) = liftIO $ uncurry Program <$> runStateT actions initDataflowState
+compile (Dataflow actions) = liftIO $ do
+  (edge, state) <- runStateT actions initDataflowState
+  return $ Program edge (Epoch 0) state
 
 -- | Feed a traversable collection of inputs to a 'Program'. All inputs provided will
 -- have the same 'Timestamp' associated with them.
@@ -58,7 +62,8 @@ compile (Dataflow actions) = liftIO $ uncurry Program <$> runStateT actions init
 execute :: (MonadIO io, Traversable t) => t i -> Program i -> io (Program i)
 execute corpus Program{..} = liftIO $ do
   newProgramState <- evalStateT (runDataflow duplicateDataflowState) programState
+  void $ execStateT (runDataflow $ input timestamp corpus programInput) newProgramState
 
-  void $ execStateT (runDataflow $ input corpus programInput) newProgramState
-
-  return $ Program programInput newProgramState
+  return $ Program programInput (inc programEpoch) newProgramState
+  where
+    timestamp = Timestamp programEpoch

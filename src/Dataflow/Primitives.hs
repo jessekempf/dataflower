@@ -15,10 +15,10 @@ module Dataflow.Primitives (
   writeState,
   modifyState,
   Edge,
+  Epoch(..),
   Timestamp(..),
+  inc,
   registerVertex,
-  registerFinalizer,
-  incrementEpoch,
   input,
   send,
   finalize
@@ -37,6 +37,7 @@ import           GHC.Exts                   (Any)
 import           Numeric.Natural            (Natural)
 import           Prelude
 import           Unsafe.Coerce              (unsafeCoerce)
+import Debug.Trace (traceM, trace)
 
 
 newtype VertexID    = VertexID        Int deriving (Eq, Ord, Show)
@@ -71,10 +72,8 @@ instance Incrementable Epoch where
 data DataflowState = DataflowState {
   dfsVertices       :: Vector Any,
   dfsStates         :: Vector (IORef Any),
-  dfsFinalizers     :: [Timestamp -> Dataflow ()],
   dfsLastVertexID   :: VertexID,
-  dfsLastStateID    :: StateID,
-  dfsLastInputEpoch :: Epoch
+  dfsLastStateID    :: StateID
 }
 
 -- | `Dataflow` is the type of all dataflow operations.
@@ -87,10 +86,8 @@ initDataflowState :: DataflowState
 initDataflowState = DataflowState {
   dfsVertices       = empty,
   dfsStates         = empty,
-  dfsFinalizers     = [],
   dfsLastVertexID   = VertexID (-1),
-  dfsLastStateID    = StateID (-1),
-  dfsLastInputEpoch = Epoch 0
+  dfsLastStateID    = StateID (-1)
 }
 
 duplicateDataflowState :: Dataflow DataflowState
@@ -104,23 +101,14 @@ duplicateDataflowState = Dataflow $ do
   where
     dupIORef = readIORef >=> newIORef
 
--- | Get the next input Epoch.
-incrementEpoch :: Dataflow Epoch
-incrementEpoch =
-  Dataflow $ do
-    epoch <- gets (dfsLastInputEpoch >>> inc)
-
-    modify $ \s -> s { dfsLastInputEpoch = epoch }
-
-    return epoch
-
-
-data Vertex i = forall s.
-    StatefulVertex
+data Vertex i =
+  forall s. StatefulVertex
       (StateRef s)
       (StateRef s -> Timestamp -> i -> Dataflow ())
+      (StateRef s -> Timestamp -> Dataflow())
   | StatelessVertex
       (Timestamp -> i -> Dataflow ())
+      (Timestamp -> Dataflow ())
 
 -- | Retrieve the vertex for a given edge.
 lookupVertex :: Edge i -> Dataflow (Vertex i)
@@ -145,11 +133,6 @@ registerVertex vertex =
       dfsVertices     = dfsVertices s `snoc` unsafeCoerce vtx,
       dfsLastVertexID = vid
     }
-
--- | Store a provided finalizer.
-registerFinalizer :: (Timestamp -> Dataflow ()) -> Dataflow ()
-registerFinalizer finalizer =
-  Dataflow $ modify $ \s -> s { dfsFinalizers = finalizer : dfsFinalizers s }
 
 -- | Mutable state that holds an `a`.
 --
@@ -207,13 +190,10 @@ modifyState sref op = do
   Dataflow $ lift $ modifyIORef' ioref (unsafeCoerce . op . unsafeCoerce)
 
 {-# INLINEABLE input #-}
-input :: Traversable t => t i -> Edge i -> Dataflow ()
-input inputs next = do
-  timestamp <- Timestamp <$> incrementEpoch
-
+input :: Traversable t => Timestamp -> t i -> Edge i -> Dataflow ()
+input timestamp inputs next = do
   mapM_ (send next timestamp) inputs
-
-  finalize timestamp
+  finalize next timestamp
 
 {-# INLINE send #-}
 -- | Send an `input` item to be worked on to the indicated vertex.
@@ -222,14 +202,14 @@ input inputs next = do
 send :: Edge input -> Timestamp -> input -> Dataflow ()
 send e t i = lookupVertex e >>= invoke t i
   where
-    invoke timestamp datum (StatefulVertex sref callback) = callback sref timestamp datum
-    invoke timestamp datum (StatelessVertex callback)     = callback timestamp datum
+    invoke timestamp datum (StatefulVertex sref callback _) = callback sref timestamp datum
+    invoke timestamp datum (StatelessVertex callback _)     = callback timestamp datum
 
 -- Notify all relevant vertices that no more input is coming for `Timestamp`.
 --
 -- @since 0.1.0.0
-finalize :: Timestamp -> Dataflow ()
-finalize t = do
-  finalizers <- Dataflow $ gets dfsFinalizers
-
-  mapM_ (\p -> p t) finalizers
+finalize :: Edge i -> Timestamp -> Dataflow ()
+finalize e t = lookupVertex e >>= invoke t
+  where
+    invoke timestamp (StatefulVertex sref _ finalizer) = finalizer sref timestamp
+    invoke timestamp (StatelessVertex _ finalizer) = finalizer timestamp

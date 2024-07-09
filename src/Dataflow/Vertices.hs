@@ -12,8 +12,8 @@ import           Control.Monad.STM           (atomically)
 import           Control.Monad.Trans.Class   (lift)
 import           Dataflow.Primitives         (Dataflow (..), Edge, StateRef,
                                               Timestamp (..), Vertex (..),
-                                              newState, registerFinalizer,
-                                              registerVertex, send)
+                                              newState,
+                                              registerVertex, send, finalize)
 import           Prelude
 import           Text.Show.Pretty            (pPrint)
 
@@ -35,8 +35,7 @@ statefulVertex ::
 statefulVertex initState callback finalizer = do
   stateRef <- newState initState
 
-  registerFinalizer $ finalizer stateRef
-  registerVertex    $ StatefulVertex stateRef callback
+  registerVertex    $ StatefulVertex stateRef callback finalizer
 
 -- | Construct a vertex with no internal state. The given procedure is invoked on each input.
 --
@@ -44,8 +43,8 @@ statefulVertex initState callback finalizer = do
 -- caller's thread. By design this is a cheap operation.
 --
 -- @since 0.1.0.0
-statelessVertex :: (Timestamp -> i -> Dataflow ()) -> Dataflow (Edge i)
-statelessVertex callback = registerVertex $ StatelessVertex callback
+statelessVertex :: (Timestamp -> i -> Dataflow ()) -> (Timestamp -> Dataflow ()) -> Dataflow (Edge i)
+statelessVertex callback finalizer = registerVertex $ StatelessVertex callback finalizer
 
 {-# NOINLINE outputTVar #-}
 -- | Construct an output vertex that stores items into the provided 'TVar'. The first argument
@@ -54,7 +53,7 @@ statelessVertex callback = registerVertex $ StatelessVertex callback
 --
 -- @since 0.1.0.0
 outputTVar :: (o -> w -> w) -> TVar w -> Dataflow (Edge o)
-outputTVar op register = statelessVertex $ \_ x -> Dataflow $ lift $ atomically $ modifyTVar' register (op x)
+outputTVar op register = statelessVertex (\_ x -> Dataflow $ lift $ atomically $ modifyTVar' register (op x)) (const $ return ())
 
 -- | Construct a vertex that pretty-prints items and passes them through unchanged.
 --
@@ -63,15 +62,10 @@ trace :: Show i => Edge i -> Dataflow (Edge i)
 trace next = do
   trace' <- ioVertex $ curry pPrint
 
-  statelessVertex $ \t x -> do
+  statelessVertex (\t x -> do
     send trace' t x
-    send next t x
+    send next t x)
+    (const $ return ())
 
   where
-    ioVertex callback = registerVertex $ StatelessVertex $ \t i -> Dataflow $ lift $ callback t i
-
--- | Construct a vertex that discards anything sent to it.
---
--- @since 0.1.2.0
-discard :: Dataflow (Edge i)
-discard = statelessVertex $ \_ _ -> return ()
+    ioVertex callback = registerVertex $ StatelessVertex (\t i -> Dataflow $ lift $ callback t i) (finalize next)

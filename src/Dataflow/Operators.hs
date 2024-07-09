@@ -1,3 +1,5 @@
+{-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE ImpredicativeTypes #-}
 {-|
 Module      : Dataflow
 Description : Timely Dataflow for Haskell
@@ -23,23 +25,44 @@ module Dataflow.Operators (
 
 import           Dataflow.Primitives (Dataflow, Edge, StateRef, Timestamp,
                                       Vertex (StatefulVertex), newState,
-                                      registerFinalizer, registerVertex, send)
+                                     registerVertex, send, finalize, modifyState, readState)
 import           Dataflow.Vertices   (statelessVertex)
-import           Prelude             (mapM_, ($), (<$>), (<*>))
+import           Prelude             (mapM_, ($), (<$>), (<*>), (==), Show (..), (++))
+import GHC.Num (Natural, Num (..))
+import Control.Monad (when, Monad ((>>)))
+import Text.Printf (printf)
+import Debug.Trace (traceM)
 
+newtype JoinState a = JoinState {
+  refCount :: Natural
+}
+
+wrappedFinalizer :: StateRef (JoinState state) -> (StateRef state -> Timestamp -> Dataflow()) -> (StateRef state -> Timestamp -> Dataflow())
+wrappedFinalizer metaRef finalizer sref ts = do
+      modifyState metaRef (\js -> JoinState { refCount = refCount js - 1})
+      count <- refCount <$> readState metaRef
+
+      traceM ("count: " ++ show count)
+
+      when (count == 0) $
+        finalizer sref ts
 
 -- | Construct a stateless vertex that sends each input to every 'Edge' in the output list.
 --
 -- @since 0.1.3.0
 fanout :: [Edge a] -> Dataflow (Edge a)
-fanout nexts = statelessVertex $ \timestamp x -> mapM_ (\next -> send next timestamp x) nexts
+fanout nexts = statelessVertex
+  (\timestamp x -> mapM_ (\next -> send next timestamp x) nexts)
+  (\timestamp -> mapM_ (`finalize` timestamp) nexts)
 
 -- | Construct a stateless vertex that applies the provided function to every input
 -- and sends the result to the output.
 --
 -- @since 0.1.3.0
 map :: (i -> o) -> Edge o -> Dataflow (Edge i)
-map f next = statelessVertex $ \timestamp x -> send next timestamp (f x)
+map f next = statelessVertex
+  (\timestamp x -> send next timestamp (f x))
+  (finalize next)
 
 -- | Construct a stateful vertex with two input edges.
 --
@@ -52,11 +75,11 @@ join2 ::
   -> Dataflow (Edge i, Edge j)
 join2 initState callbackI callbackJ finalizer = do
   stateRef <- newState initState
+  metaRef <- newState (JoinState 2)
 
-  registerFinalizer $ finalizer stateRef
+  (,) <$> registerVertex (StatefulVertex stateRef callbackI (wrappedFinalizer metaRef finalizer))
+      <*> registerVertex (StatefulVertex stateRef callbackJ (wrappedFinalizer metaRef finalizer))
 
-  (,) <$> registerVertex (StatefulVertex stateRef callbackI)
-      <*> registerVertex (StatefulVertex stateRef callbackJ)
 
 -- | Construct a stateful vertex with three input edges.
 --
@@ -70,12 +93,12 @@ join3 ::
   -> Dataflow (Edge i, Edge j, Edge k)
 join3 initState callbackI callbackJ callbackK finalizer = do
   stateRef <- newState initState
+  metaRef <- newState (JoinState 3)
 
-  registerFinalizer $ finalizer stateRef
 
-  (,,) <$> registerVertex (StatefulVertex stateRef callbackI)
-       <*> registerVertex (StatefulVertex stateRef callbackJ)
-       <*> registerVertex (StatefulVertex stateRef callbackK)
+  (,,) <$> registerVertex (StatefulVertex stateRef callbackI (wrappedFinalizer metaRef finalizer))
+       <*> registerVertex (StatefulVertex stateRef callbackJ (wrappedFinalizer metaRef finalizer))
+       <*> registerVertex (StatefulVertex stateRef callbackK (wrappedFinalizer metaRef finalizer))
 
 -- | Construct a stateful vertex with four input edges.
 --
@@ -90,13 +113,12 @@ join4 ::
   -> Dataflow (Edge i1, Edge i2, Edge i3, Edge i4)
 join4 initState callback1 callback2 callback3 callback4 finalizer = do
   stateRef <- newState initState
+  metaRef <- newState (JoinState 4)
 
-  registerFinalizer $ finalizer stateRef
-
-  (,,,) <$> registerVertex (StatefulVertex stateRef callback1)
-        <*> registerVertex (StatefulVertex stateRef callback2)
-        <*> registerVertex (StatefulVertex stateRef callback3)
-        <*> registerVertex (StatefulVertex stateRef callback4)
+  (,,,) <$> registerVertex (StatefulVertex stateRef callback1 (wrappedFinalizer metaRef finalizer))
+        <*> registerVertex (StatefulVertex stateRef callback2 (wrappedFinalizer metaRef finalizer))
+        <*> registerVertex (StatefulVertex stateRef callback3 (wrappedFinalizer metaRef finalizer))
+        <*> registerVertex (StatefulVertex stateRef callback4 (wrappedFinalizer metaRef finalizer))
 
 -- | Construct a stateful vertex with five input edges.
 --
@@ -112,14 +134,13 @@ join5 ::
   -> Dataflow (Edge i1, Edge i2, Edge i3, Edge i4, Edge i5)
 join5 initState callback1 callback2 callback3 callback4 callback5 finalizer = do
   stateRef <- newState initState
+  metaRef <- newState (JoinState 5)
 
-  registerFinalizer $ finalizer stateRef
-
-  (,,,,) <$> registerVertex (StatefulVertex stateRef callback1)
-         <*> registerVertex (StatefulVertex stateRef callback2)
-         <*> registerVertex (StatefulVertex stateRef callback3)
-         <*> registerVertex (StatefulVertex stateRef callback4)
-         <*> registerVertex (StatefulVertex stateRef callback5)
+  (,,,,) <$> registerVertex (StatefulVertex stateRef callback1 (wrappedFinalizer metaRef finalizer))
+         <*> registerVertex (StatefulVertex stateRef callback2 (wrappedFinalizer metaRef finalizer))
+         <*> registerVertex (StatefulVertex stateRef callback3 (wrappedFinalizer metaRef finalizer))
+         <*> registerVertex (StatefulVertex stateRef callback4 (wrappedFinalizer metaRef finalizer))
+         <*> registerVertex (StatefulVertex stateRef callback5 (wrappedFinalizer metaRef finalizer))
 
 -- | Construct a stateful vertex with six input edges.
 --
@@ -136,12 +157,11 @@ join6 ::
   -> Dataflow (Edge i1, Edge i2, Edge i3, Edge i4, Edge i5, Edge i6)
 join6 initState callback1 callback2 callback3 callback4 callback5 callback6 finalizer = do
   stateRef <- newState initState
+  metaRef <- newState (JoinState 6)
 
-  registerFinalizer $ finalizer stateRef
-
-  (,,,,,) <$> registerVertex (StatefulVertex stateRef callback1)
-          <*> registerVertex (StatefulVertex stateRef callback2)
-          <*> registerVertex (StatefulVertex stateRef callback3)
-          <*> registerVertex (StatefulVertex stateRef callback4)
-          <*> registerVertex (StatefulVertex stateRef callback5)
-          <*> registerVertex (StatefulVertex stateRef callback6)
+  (,,,,,) <$> registerVertex (StatefulVertex stateRef callback1 (wrappedFinalizer metaRef finalizer))
+          <*> registerVertex (StatefulVertex stateRef callback2 (wrappedFinalizer metaRef finalizer))
+          <*> registerVertex (StatefulVertex stateRef callback3 (wrappedFinalizer metaRef finalizer))
+          <*> registerVertex (StatefulVertex stateRef callback4 (wrappedFinalizer metaRef finalizer))
+          <*> registerVertex (StatefulVertex stateRef callback5 (wrappedFinalizer metaRef finalizer))
+          <*> registerVertex (StatefulVertex stateRef callback6 (wrappedFinalizer metaRef finalizer))

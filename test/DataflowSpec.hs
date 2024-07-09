@@ -11,12 +11,12 @@ import           Test.Dataflow               (runDataflow)
 import           Test.Hspec
 import           Test.QuickCheck             hiding (discard)
 import           Test.QuickCheck.Modifiers   (NonEmptyList (..))
-
+import Debug.Trace (traceM)
 
 spec :: Spec
 spec = do
   it "can pass through data without modification" $ property $ do
-    let passthrough next = statelessVertex $ \t x -> send next t x
+    let passthrough next = statelessVertex (send next) (finalize next)
 
     \(numbers :: [Integer]) -> runDataflow passthrough numbers `shouldReturn` numbers
 
@@ -48,7 +48,7 @@ spec = do
 
   describe "discard" $
     it "discards all input" $ property $
-      \(numbers :: [Int]) -> runDataflow (const discard) numbers `shouldReturn` ([] :: [Int])
+      \(numbers :: [Int]) -> runDataflow discard numbers `shouldReturn` ([] :: [()])
 
 storeAndForward :: Edge i -> Dataflow (Edge i)
 storeAndForward next = statefulVertex [] store forward
@@ -57,16 +57,16 @@ storeAndForward next = statefulVertex [] store forward
     forward sref t = do
       mapM_ (send next t) . reverse =<< readState sref
       writeState sref []
+      finalize next t
 
 integrate :: Edge Int -> Dataflow (Edge Int)
-integrate next = statefulVertex 0 recv finalize
+integrate next = statefulVertex 0 recv (const $ finalize next)
   where
     recv s t i   = do
       modifyState s (+ i)
 
       send next t =<< readState s
 
-    finalize _ _ = return ()
+discard :: Edge () -> Dataflow (Edge i)
+discard next = statelessVertex (\_ _ -> return ()) (finalize next)
 
-discard :: Dataflow (Edge i)
-discard = statelessVertex $ \_ _ -> return ()
