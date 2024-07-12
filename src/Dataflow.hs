@@ -15,34 +15,21 @@ module Dataflow (
   Dataflow,
   Edge,
   Timestamp,
-  StateRef,
   send,
-  finalize,
-  loop,
-  Egress,
-  egress,
-  finalizeEgress,
-  Feedback,
-  feedback,
-  finalizeFeedback,
-  readState,
-  writeState,
-  modifyState,
-  statefulVertex,
-  statelessVertex,
-  outputTVar,
-  trace,
+  vertex,
   Program,
+  programLastTimestamp,
   compile,
   execute
 ) where
 
 import           Control.Monad              (void)
 import           Control.Monad.IO.Class     (MonadIO (..))
-import           Control.Monad.State.Strict (evalStateT, execStateT, runStateT)
 import           Data.Traversable           (Traversable)
 import           Dataflow.Primitives
-import           Dataflow.Vertices
+import Control.Monad.Reader (ReaderT(runReaderT))
+import Data.IORef (newIORef, IORef)
+import Debug.Trace (traceM)
 
 -- | A 'Program' represents a fully-preprocessed 'Dataflow' that may be
 -- executed against inputs.
@@ -50,8 +37,8 @@ import           Dataflow.Vertices
 -- @since 0.1.0.0
 data Program i = Program {
   programInput :: Edge i,
-  programEpoch :: Epoch,
-  programState :: DataflowState
+  programLastEpoch :: Epoch,
+  programState :: IORef DataflowState
 }
 
 -- | Take a 'Dataflow' which takes 'i's as input and compile it into a 'Program'.
@@ -59,18 +46,25 @@ data Program i = Program {
 -- @since 0.1.0.0
 compile :: MonadIO io => Dataflow (Edge i) -> io (Program i)
 compile (Dataflow actions) = liftIO $ do
-  (edge, state) <- runStateT actions initDataflowState
-  return $ Program edge (Epoch 0) state
+  -- traceM "== COMPILING =="
+  stateRef <- newIORef initDataflowState
+  edge <- runReaderT actions stateRef
+  return $ Program edge (Epoch 0) stateRef
 
 -- | Feed a traversable collection of inputs to a 'Program'. All inputs provided will
 -- have the same 'Timestamp' associated with them.
 --
 -- @since 0.1.0.0
-execute :: (MonadIO io, Traversable t) => t i -> Program i -> io (Program i)
+execute :: (MonadIO io, Traversable t, Show (t i), Show i) => t i -> Program i -> io (Program i)
 execute corpus Program{..} = liftIO $ do
-  newProgramState <- evalStateT (runDataflow duplicateDataflowState) programState
-  void $ execStateT (runDataflow $ input timestamp corpus programInput) newProgramState
+  -- traceM ("== EXECUTING " ++ show timestamp ++ " ==")
+  runReaderT (runDataflow $ input programInput timestamp corpus) programState
 
-  return $ Program programInput (inc programEpoch) newProgramState
+  return $ Program programInput epoch programState
+
   where
-    timestamp = Timestamp programEpoch []
+    epoch = inc programLastEpoch
+    timestamp = Timestamp epoch
+
+programLastTimestamp :: Program i -> Timestamp
+programLastTimestamp Program{..} = Timestamp programLastEpoch

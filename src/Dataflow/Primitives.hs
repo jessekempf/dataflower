@@ -1,75 +1,85 @@
 {-# LANGUAGE ExistentialQuantification  #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE MultiParamTypeClasses      #-}
+{-# LANGUAGE RankNTypes                 #-}
 {-# LANGUAGE RecordWildCards            #-}
-{-# LANGUAGE RankNTypes #-}
-{-# LANGUAGE StandaloneDeriving #-}
-{-# LANGUAGE RecursiveDo #-}
-{-# LANGUAGE InstanceSigs #-}
+{-# OPTIONS_GHC -Wno-unrecognised-pragmas #-}
+{-# HLINT ignore "Use readTVarIO" #-}
+{-# LANGUAGE ScopedTypeVariables        #-}
 
-module Dataflow.Primitives (
-  Dataflow(..),
-  DataflowState,
-  Vertex(..),
-  initDataflowState,
-  duplicateDataflowState,
-  StateRef,
-  newState,
-  readState,
-  writeState,
-  modifyState,
-  Edge,
-  Egress,
-  Feedback,
-  Epoch(..),
-  Timestamp(..),
-  inc,
-  registerVertex,
-  input,
-  send,
-  finalize,
-  loop,
-  egress,
-  finalizeEgress,
-  feedback,
-  finalizeFeedback,
-) where
+module Dataflow.Primitives
+  ( Dataflow (..),
+    DataflowState,
+    Vertex (..),
+    initDataflowState,
+    Edge,
+    Epoch (..),
+    Timestamp (..),
+    modifyIORef',
+    atomically,
+    inc,
+    send,
+    -- drain,
+    vertex,
+    input,
+  )
+where
 
-import           Control.Arrow              ((>>>))
-import           Control.Monad              (forM, (>=>))
-import           Control.Monad.IO.Class     (liftIO)
-import Control.Monad.Fix (MonadFix)
-import           Control.Monad.State.Strict (StateT, get, gets, modify, MonadFix (..))
-import           Control.Monad.Trans        (lift)
-import           Data.Hashable              (Hashable (..))
-import           Data.IORef                 (IORef, modifyIORef', newIORef,
-                                             readIORef, writeIORef)
-import           Data.Vector                (Vector, empty, snoc, unsafeIndex)
-import           GHC.Exts                   (Any)
-import           Numeric.Natural            (Natural)
-import           Prelude
-import           Unsafe.Coerce              (unsafeCoerce)
-import Data.Vector.Generic.New (run)
+import           Control.Arrow               ((>>>))
+import           Control.Concurrent          (ThreadId, forkIO)
+import           Control.Concurrent.STM      (STM, modifyTVar, modifyTVar',
+                                              newTVar, readTVar, readTVarIO,
+                                              retry, writeTVar)
+import qualified Control.Concurrent.STM
+import           Control.Concurrent.STM.TVar (TVar, newTVarIO)
+import           Control.Monad               (forM_, unless, when)
+import           Control.Monad.IO.Class      (liftIO)
+import           Control.Monad.Reader        (MonadReader (ask),
+                                              ReaderT (runReaderT))
+import           Data.Functor                ((<&>))
+import           Data.Functor.Contravariant  (Contravariant (contramap))
+import           Data.Hashable               (Hashable (..))
+import           Data.IORef                  (IORef)
+import qualified Data.IORef
+import           Data.Map.Strict             (Map)
+import qualified Data.Map.Strict
+import qualified Data.PQueue.Min             as MinQ
+import qualified Data.PQueue.Prio.Min        as MinPQ
+import           Data.Set                    (Set)
+import qualified Data.Set
+import           Data.Vector                 (Vector, empty, length, snoc,
+                                              unsafeIndex, (!))
+import           Data.Void                   (Void)
+import           Debug.Trace                 (traceM, traceShowM)
+import           GHC.Exts                    (Any)
+import           Numeric.Natural             (Natural)
+import           Prelude                     hiding (min)
+import           Text.Printf
+import           Unsafe.Coerce               (unsafeCoerce)
 
+newtype VertexID = VertexID Int deriving (Eq, Ord, Show)
 
-newtype VertexID    = VertexID        Int deriving (Eq, Ord, Show)
-newtype StateID     = StateID         Int deriving (Eq, Ord, Show)
-newtype Epoch       = Epoch       Natural deriving (Eq, Ord, Hashable, Show)
-newtype LoopCounter = LoopCounter Natural deriving (Eq, Ord, Hashable, Show)
+newtype StateID = StateID Int deriving (Eq, Ord, Show)
+
+newtype Epoch = Epoch Natural deriving (Eq, Ord, Hashable, Show)
+
 -- | 'Timestamp's represent instants in the causal timeline.
 --
 -- @since 0.1.0.0
-data Timestamp   = Timestamp     Epoch [LoopCounter] deriving (Eq, Ord, Show)
+newtype Timestamp = Timestamp Epoch deriving (Eq, Ord, Show)
 
 instance Hashable Timestamp where
-  hashWithSalt salt (Timestamp epoch counters) = hashWithSalt salt epoch ^ hashWithSalt salt counters
-
+  hashWithSalt salt (Timestamp epoch) = hashWithSalt salt epoch
 
 -- | An 'Edge' is a typed reference to a computational vertex that
 -- takes 'a's as its input.
 --
 -- @since 0.1.0.0
-newtype Edge a      = Edge       VertexID
+data Edge a = forall b. Show b => Edge (a -> b) VertexID
+
+instance Contravariant Edge where
+  contramap f (Edge g vid) = Edge (g . f) vid
+
 
 -- | Class of entities that can be incremented by one.
 class Incrementable a where
@@ -84,196 +94,193 @@ instance Incrementable StateID where
 instance Incrementable Epoch where
   inc (Epoch n) = Epoch (n + 1)
 
-instance Incrementable LoopCounter where
-  inc (LoopCounter n) = LoopCounter (n + 1)
+data DataflowState = DataflowState
+  { dfsVertices           :: Vector Any,
+    dfsLastVertexID       :: VertexID,
+    dfsTimestampCounts    :: TVar (Map Timestamp Natural),
+    dfsTimestampProducers :: TVar (Map Timestamp (Set VertexID))
+  }
 
-data DataflowState = DataflowState {
-  dfsVertices       :: Vector Any,
-  dfsStates         :: Vector (IORef Any),
-  dfsLastVertexID   :: VertexID,
-  dfsLastStateID    :: StateID
-}
+initDataflowState :: STM DataflowState
+initDataflowState = do
+  dfsTimestampCounts <- newTVar Data.Map.Strict.empty
+  dfsTimestampProducers <- newTVar Data.Map.Strict.empty
+
+  return DataflowState{..}
+
+  where
+    dfsVertices = empty
+    dfsLastVertexID = VertexID (-1)
 
 -- | `Dataflow` is the type of all dataflow operations.
 --
 -- @since 0.1.0.0
-newtype Dataflow a = Dataflow { runDataflow :: StateT DataflowState IO a }
+newtype Dataflow a = Dataflow {runDataflow :: ReaderT (IORef DataflowState) IO a}
   deriving (Functor, Applicative, Monad)
 
-initDataflowState :: DataflowState
-initDataflowState = DataflowState {
-  dfsVertices       = empty,
-  dfsStates         = empty,
-  dfsLastVertexID   = VertexID (-1),
-  dfsLastStateID    = StateID (-1)
-}
+gets :: (DataflowState -> a) -> Dataflow a
+gets f = Dataflow ask >>= readIORef <&> f
 
-duplicateDataflowState :: Dataflow DataflowState
-duplicateDataflowState = Dataflow $ do
-  DataflowState{..} <- get
+modify :: (DataflowState -> DataflowState) -> Dataflow ()
+modify f = Dataflow ask >>= \r -> modifyIORef' r f
 
-  newStates <- liftIO $ forM dfsStates dupIORef
+forkDataflow :: Dataflow () -> Dataflow ThreadId
+forkDataflow action = Dataflow $ do
+  stateRef <- ask
 
-  return $ DataflowState { dfsStates = newStates, .. }
+  liftIO . forkIO $
+    runReaderT (runDataflow action) stateRef
 
-  where
-    dupIORef = readIORef >=> newIORef
+atomically :: STM a -> Dataflow a
+atomically = Dataflow . liftIO . Control.Concurrent.STM.atomically
 
-data Vertex i =
-  forall s. StatefulVertex
-      (StateRef s)
-      (StateRef s -> Timestamp -> i -> Dataflow ())
-      (StateRef s -> Timestamp -> Dataflow())
-  | LoopContext    (Nested (Edge i))
-  | StatelessVertex
-      (Timestamp -> i -> Dataflow ())
-      (Timestamp -> Dataflow ())
+readIORef :: IORef a -> Dataflow a
+readIORef = Dataflow . liftIO . Data.IORef.readIORef
 
--- | Retrieve the vertex for a given edge.
-lookupVertex :: Edge i -> Dataflow (Vertex i)
-lookupVertex (Edge (VertexID vindex)) =
-  Dataflow $ do
-    vertices <- gets dfsVertices
+writeIORef :: IORef a -> a -> Dataflow ()
+writeIORef ref = Dataflow . liftIO . Data.IORef.writeIORef ref
 
-    return $ unsafeCoerce (vertices `unsafeIndex` vindex)
+modifyIORef' :: IORef a -> (a -> a) -> Dataflow ()
+modifyIORef' ref = Dataflow . liftIO . Data.IORef.modifyIORef' ref
 
--- | Store a provided vertex and obtain an 'Edge' that refers to it.
-registerVertex :: Vertex i -> Dataflow (Edge i)
-registerVertex vertex =
-  Dataflow $ do
-    vid <- gets (dfsLastVertexID >>> inc)
+runStatefully :: IORef s -> (s -> Dataflow s) -> Dataflow ()
+runStatefully stateRef action = readIORef stateRef >>= action >>= writeIORef stateRef
 
-    modify $ addVertex vertex vid
+data RunState =  Run | Stop deriving (Eq, Show)
 
-    return (Edge vid)
+data Vertex i = forall s. Vertex {
+    runState       :: TVar RunState,
+    vertexStateRef :: IORef s,
+    threadId       :: ThreadId,
+    inputQueue     :: TVar (MinPQ.MinPQueue Timestamp i)--,
+    -- notifyQueue    :: TVar (MinQ.MinQueue Timestamp)
+  }
 
-  where
-    addVertex vtx vid s = s {
-      dfsVertices     = dfsVertices s `snoc` unsafeCoerce vtx,
-      dfsLastVertexID = vid
-    }
+vertex :: Show i => state -> (Timestamp -> i -> state -> Dataflow state) -> (Timestamp -> state -> Dataflow state) -> Dataflow (Edge i)
+vertex initialState onSend onNotify = do
+  timestampCounters <- gets dfsTimestampCounts
+  timestampProducers <- gets dfsTimestampProducers
 
--- | Mutable state that holds an `a`.
---
--- @since 0.1.0.0
-newtype StateRef a = StateRef StateID
+  runState <- Dataflow . liftIO $ newTVarIO Run
+  vertexStateRef <- Dataflow . liftIO $ Data.IORef.newIORef initialState
+  inputQueue <- Dataflow . liftIO $ newTVarIO MinPQ.empty
+  notifyQueue <- Dataflow . liftIO $ newTVarIO MinQ.empty
 
--- | Create a `StateRef` initialized to the provided `a`.
---
--- @since 0.1.0.0
-newState :: a -> Dataflow (StateRef a)
-newState a =
-  Dataflow $ do
-    sid   <- gets (dfsLastStateID >>> inc)
-    ioref <- lift $ newIORef (unsafeCoerce a)
+  vertexId <- gets (dfsLastVertexID >>> inc)
 
-    modify $ addState ioref sid
+  vtx <- do
+    threadId <- forkDataflow $ do
+      loopCountRef <- Dataflow . liftIO $ Data.IORef.newIORef (0 :: Natural)
+      -- traceM "\n"
+      -- traceM $ printf "%s started" (show vertexId)
 
-    return (StateRef sid)
+      while runState (== Run) $ do
+        loopCount <- readIORef loopCountRef
 
-  where
-    addState ref sid s = s {
-      dfsStates      = dfsStates s `snoc` ref,
-      dfsLastStateID = sid
-    }
+        -- traceM $ printf "%s: Loop %d started!" (show vertexId) loopCount
 
-lookupStateRef :: StateRef s -> Dataflow (IORef Any)
-lookupStateRef (StateRef (StateID sindex)) =
-  Dataflow $ do
-    states <- gets dfsStates
+        (mbWorkUnit, mbFinishedTimestamp) <- atomically $ do
+          iq <- readTVar inputQueue
+          nq <- readTVar notifyQueue
 
-    return (states `unsafeIndex` sindex)
+          if MinPQ.null iq && MinQ.null nq then do
+            -- traceM $ printf "%s: loop %d retrying" (show vertexId) loopCount
+            retry
+          else
+            return ()
+            -- traceM $ printf "%s: loop continuing" (show vertexId)
 
--- | Read the value stored in the `StateRef`.
---
--- @since 0.1.0.0
-readState :: StateRef a -> Dataflow a
-readState sref = do
-  ioref <- lookupStateRef sref
-  Dataflow $ lift (unsafeCoerce <$> readIORef ioref)
+          -- traceM "inputQueue ==v"
+          -- traceShowM iq
+          -- traceM "inputQueue ==^"
 
--- | Overwrite the value stored in the `StateRef`.
---
--- @since 0.1.0.0
-writeState :: StateRef a -> a -> Dataflow ()
-writeState sref x = do
-  ioref <- lookupStateRef sref
-  Dataflow $ lift $ writeIORef ioref (unsafeCoerce x)
+          case (MinPQ.minViewWithKey iq, MinQ.minView nq) of
+            (Nothing, Nothing) ->
+              return (Nothing, Nothing)
+            (Nothing, Just (finishedTimestamp, nq')) -> do
+              writeTVar notifyQueue nq'
+              return (Nothing, Just finishedTimestamp)
+            (Just (workUnit, iq'), Nothing) -> do
+              writeTVar inputQueue iq'
+              return (Just workUnit, Nothing)
+            (Just ((timestamp, i), iq'), Just (finishedTimestamp, nq')) ->
+              if timestamp > finishedTimestamp then do
+                writeTVar inputQueue iq'
+                writeTVar notifyQueue nq'
+                return (Just (timestamp, i), Just finishedTimestamp)
+              else do
+                writeTVar inputQueue iq'
+                return (Just (timestamp, i), Nothing)
 
--- | Update the value stored in `StateRef`.
---
--- @since 0.1.0.0
-modifyState :: StateRef a -> (a -> a) -> Dataflow ()
-modifyState sref op = do
-  ioref <- lookupStateRef sref
-  Dataflow $ lift $ modifyIORef' ioref (unsafeCoerce . op . unsafeCoerce)
+        traceM $ printf "%s: %s" (show vertexId) (show (mbWorkUnit, mbFinishedTimestamp))
 
-{-# INLINEABLE input #-}
-input :: Traversable t => Timestamp -> t i -> Edge i -> Dataflow ()
-input timestamp inputs next = do
-  mapM_ (send next timestamp) inputs
-  finalize next timestamp
+        case (mbWorkUnit, mbFinishedTimestamp) of
+          (Nothing, Nothing) -> return ()
+          (Just (timestamp, item), Nothing) -> do
+            traceM $ printf "%s: running onSend for %s / %s" (show vertexId) (show timestamp) (show item)
+            runStatefully vertexStateRef $ onSend timestamp item
+          (Nothing, Just finishedTimestamp) -> do
+            traceM $ printf "%s: running onNotify for %s" (show vertexId) (show finishedTimestamp)
+            runStatefully vertexStateRef $ onNotify finishedTimestamp
+          (Just (timestamp, item), Just finishedTimestamp) -> do
+            traceM $ printf "%s: running onNotify for %s" (show vertexId) (show finishedTimestamp)
+            runStatefully vertexStateRef $ onNotify finishedTimestamp
+            traceM $ printf "%s: running onSend for %s / %s" (show vertexId) (show timestamp) (show item)
+            runStatefully vertexStateRef $ onSend timestamp item
 
-{-# INLINE send #-}
--- | Send an `input` item to be worked on to the indicated vertex.
---
--- @since 0.1.0.0
-send :: Edge input -> Timestamp -> input -> Dataflow ()
-send e t i = lookupVertex e >>= invoke t i
-  where
-    invoke timestamp datum (StatefulVertex sref callback _) = callback sref timestamp datum
-    invoke timestamp datum (LoopContext defineLoop) = do
-      loopInput <- runNested defineLoop
-      send loopInput (nestLoop timestamp) datum
-    invoke timestamp datum (StatelessVertex callback _)     = callback timestamp datum
+        -- traceM $ printf "%s: Loop %d completed!" (show vertexId) loopCount
+        modifyIORef' loopCountRef (+ 1)
 
-    nestLoop (Timestamp epoch lcs) = Timestamp epoch (LoopCounter 0 : lcs)
--- Notify all relevant vertices that no more input is coming for `Timestamp`.
---
--- @since 0.1.0.0
-finalize :: Edge i -> Timestamp -> Dataflow ()
-finalize e t = lookupVertex e >>= invoke t
-  where
-    invoke timestamp (StatefulVertex sref _ finalizer) = finalizer sref timestamp
-    invoke timestamp (LoopContext defineLoop) = do
-      loopInput <- runNested defineLoop
-      finalize loopInput timestamp
-    invoke timestamp (StatelessVertex _ finalizer) = finalizer timestamp
+    return Vertex{..}
 
-newtype Feedback a = Feedback (Edge a)
-newtype Egress a = Egress (Edge a)
-newtype Nested a = Nested { runNested ::  Dataflow a } deriving (Functor, Applicative, Monad)
+  vertices <- gets (dfsVertices >>> (`snoc` unsafeCoerce vtx))
+  modify (\s -> s { dfsVertices = vertices, dfsLastVertexID = vertexId })
 
-instance MonadFix Nested where
-  mfix :: (a -> Nested a) -> Nested a
-  mfix execute = Nested $ Dataflow $ mfix (runDataflow . runNested . execute)
+  return (Edge id vertexId)
 
+    where
+      while :: TVar a -> (a -> Bool) -> Dataflow () -> Dataflow ()
+      while stateVar predicate action = do
+        state <- Dataflow . liftIO $ readTVarIO stateVar
+        when (predicate state) $ do
+          action
+          while stateVar predicate action
 
-{-# INLINE feedback #-}
-{-# ANN feedback "HLint: ignore Eta reduce" #-}
-feedback :: Feedback feedback -> Timestamp -> feedback -> Dataflow ()
-feedback (Feedback f) t datum = send f (incLoopCounter t) datum
-  where
-    incLoopCounter (Timestamp _ []) = error "programming error: incrementing non-existent loop counter"
-    incLoopCounter (Timestamp e (counter : lcs)) = Timestamp e (inc counter : lcs)
+send :: Show i => Edge i -> Timestamp -> i -> Dataflow ()
+send (Edge f vid@(VertexID vindex)) timestamp i = do
+  -- traceM $ printf "sending %s to %s" (show i) (show vid)
+  (vtx :: Vertex b) <- gets (dfsVertices >>> (! vindex) >>> unsafeCoerce)
+  timestampCounters <- gets dfsTimestampCounts
+  -- traceM $ printf "send to %s: loaded vertex" (show vid)
 
-finalizeFeedback :: Feedback feedback -> Timestamp -> Dataflow ()
-finalizeFeedback (Feedback f) = finalize f
+  atomically $ do
+    modifyTVar' (inputQueue vtx) (MinPQ.insert timestamp (f i))
+    modifyTVar' timestampCounters (Data.Map.Strict.adjust (+1) timestamp)
+    -- traceM $ printf "send to %s: updated vertex input queue" (show vid)
+    -- iq <- readTVar (inputQueue vtx)
+    -- traceM $ printf "send to %s: input queue: %s" (show vid) (show iq)
 
-{-# INLINE egress #-}
-{-# ANN egress "HLint: ignore Eta reduce" #-}
-egress :: Egress o -> Timestamp -> o -> Dataflow ()
-egress (Egress o) t datum = send o (unnestLoop t) datum
-  where
-    unnestLoop (Timestamp _ []) = error "programming error: unnesting non-nested timestamp"
-    unnestLoop (Timestamp e (_ : lcs)) = Timestamp e lcs
+-- drain :: Dataflow()
+-- drain = do
+--   (vertices :: Vector (Vertex Void)) <- gets (dfsVertices >>> unsafeCoerce)
 
-finalizeEgress :: Egress o -> Timestamp -> Dataflow ()
-finalizeEgress (Egress o) = finalize o
+--   forM_ vertices $ \vtx ->
+--     atomically $ do
+--       nq <- readTVar (notifyQueue vtx)
+--       unless (MinQ.null nq) retry
 
-loop :: (Egress o -> Feedback i -> Dataflow (Edge i)) -> Edge o -> Dataflow (Edge i)
-loop nestedFlow out =
-  registerVertex $ LoopContext (mdo
-    input <- Nested $ nestedFlow (Egress out) (Feedback input)
-    return input
-  )
+input :: (Show i, Show (t i), Traversable t) => Edge i -> Timestamp -> t i -> Dataflow ()
+input edge timestamp items = do
+  timestampCounters <- gets dfsTimestampCounts
+  timestampProducers <- gets dfsTimestampProducers
+  (VertexID maxVertexIdx) <- gets dfsLastVertexID
+
+  let vertexIds = Data.Set.fromList $ map VertexID [0..maxVertexIdx]
+
+  atomically $ do
+    modifyTVar' timestampCounters (Data.Map.Strict.insert timestamp 0)
+    modifyTVar' timestampProducers (Data.Map.Strict.insert timestamp vertexIds)
+
+  traceM (show timestamp ++ " -> inputting: " ++ show items)
+  forM_ items $ send edge timestamp
+  traceM (show timestamp ++ " -> inputted: " ++ show items)

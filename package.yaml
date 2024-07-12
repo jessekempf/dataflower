@@ -22,8 +22,10 @@ library:
     - Dataflow.Operators
     - Test.Dataflow
   dependencies:
+    - containers
     - hashable
     - mtl
+    - pqueue
     - pretty-show
     - stm
     - time
@@ -41,12 +43,12 @@ tests:
       - QuickCheck
       - stm
 
-benchmarks:
-  performance:
-    main: Main.hs
-    source-dirs: benchmark
-    dependencies:
-      - dataflower
-      - criterion
-      - stm
-    ghc-options: -O2
+# benchmarks:
+#   performance:
+#     main: Main.hs
+#     source-dirs: benchmark
+#     dependencies:
+#       - dataflower
+#       - criterion
+#       - stm
+#     ghc-options: -O2
