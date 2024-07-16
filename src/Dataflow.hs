@@ -1,4 +1,5 @@
 {-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE LambdaCase #-}
 
 {-|
 Module      : Dataflow
@@ -17,26 +18,33 @@ module Dataflow (
   Timestamp,
   send,
   vertex,
+  VertexReference,
+  connect,
   Program,
   programLastTimestamp,
   compile,
-  execute
+  execute,
+  synchronize,
+  outputSTM,
 ) where
 
 import           Control.Monad              (void)
 import           Control.Monad.IO.Class     (MonadIO (..))
 import           Data.Traversable           (Traversable)
 import           Dataflow.Primitives
-import Control.Monad.Reader (ReaderT(runReaderT))
+import Control.Monad.Reader (ReaderT(runReaderT),)
 import Data.IORef (newIORef, IORef)
 import Debug.Trace (traceM)
+import Control.Concurrent.STM (STM)
+import qualified Data.Map.Strict
+import Text.Printf (printf)
 
 -- | A 'Program' represents a fully-preprocessed 'Dataflow' that may be
 -- executed against inputs.
 --
 -- @since 0.1.0.0
 data Program i = Program {
-  programInput :: Edge i,
+  programInput :: VertexReference i,
   programLastEpoch :: Epoch,
   programState :: IORef DataflowState
 }
@@ -44,7 +52,7 @@ data Program i = Program {
 -- | Take a 'Dataflow' which takes 'i's as input and compile it into a 'Program'.
 --
 -- @since 0.1.0.0
-compile :: MonadIO io => Dataflow (Edge i) -> io (Program i)
+compile :: MonadIO io => Dataflow (VertexReference i) -> io (Program i)
 compile (Dataflow actions) = liftIO $ do
   -- traceM "== COMPILING =="
   stateRef <- newIORef initDataflowState
@@ -55,7 +63,7 @@ compile (Dataflow actions) = liftIO $ do
 -- have the same 'Timestamp' associated with them.
 --
 -- @since 0.1.0.0
-execute :: (MonadIO io, Traversable t, Show (t i), Show i) => t i -> Program i -> io (Program i)
+execute :: (MonadIO io, Traversable t, Show (t i), Show i, Eq i) => t i -> Program i -> io (Program i)
 execute corpus Program{..} = liftIO $ do
   -- traceM ("== EXECUTING " ++ show timestamp ++ " ==")
   runReaderT (runDataflow $ input programInput timestamp corpus) programState
@@ -66,5 +74,23 @@ execute corpus Program{..} = liftIO $ do
     epoch = inc programLastEpoch
     timestamp = Timestamp epoch
 
+synchronize :: MonadIO io => Program i -> io ()
+synchronize program = liftIO $ runReaderT (runDataflow quiesce) (programState program)
+
 programLastTimestamp :: Program i -> Timestamp
 programLastTimestamp Program{..} = Timestamp programLastEpoch
+
+outputSTM :: (Eq o, Show o) => ([o] -> STM ()) -> Dataflow (VertexReference o)
+outputSTM stmAction =
+  vertex (Data.Map.Strict.empty :: Data.Map.Strict.Map Timestamp [o])
+  (\timestamp o state ->
+    return $ Data.Map.Strict.alter (\case
+                                      Nothing -> Just [o]
+                                      Just accum -> Just (o : accum)
+                                    ) timestamp state
+  )(\timestamp state -> do
+      -- traceM $ printf "%s -> %s" (show timestamp) (show state)
+      atomically (stmAction $ state Data.Map.Strict.! timestamp)
+      -- traceM $ printf "outputSTM: ran stmAction(%s)" (show $ state Data.Map.Strict.! timestamp)
+      return $ Data.Map.Strict.delete timestamp state
+  )

@@ -38,17 +38,18 @@ tests:
     source-dirs:
       - test
     dependencies:
+      - containers
       - dataflower
       - hspec >=2.0.0
       - QuickCheck
       - stm
 
-# benchmarks:
-#   performance:
-#     main: Main.hs
-#     source-dirs: benchmark
-#     dependencies:
-#       - dataflower
-#       - criterion
-#       - stm
-#     ghc-options: -O2
+benchmarks:
+  performance:
+    main: Main.hs
+    source-dirs: benchmark
+    dependencies:
+      - dataflower
+      - criterion
+      - stm
+    ghc-options: -O2

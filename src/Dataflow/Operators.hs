@@ -24,6 +24,7 @@ import Control.Monad (forM_)
 --
 -- @since 0.1.3.0
 fanout :: Show i => [Edge i] -> Dataflow (Edge i)
-fanout nexts = vertex ()
-  (\timestamp a _ -> forM_ nexts (\next -> send next timestamp a))
-  (\_ _ -> return ())
+-- fanout nexts = vertex ()
+--   (\timestamp a _ -> forM_ nexts (\next -> send next timestamp a))
+--   (\_ _ -> return ())
+fanout = undefined

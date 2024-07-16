@@ -11,6 +11,7 @@ module Dataflow.Primitives
   ( Dataflow (..),
     DataflowState,
     Vertex (..),
+    VertexReference,
     initDataflowState,
     Edge,
     Epoch (..),
@@ -19,9 +20,10 @@ module Dataflow.Primitives
     atomically,
     inc,
     send,
-    -- drain,
+    connect,
     vertex,
     input,
+    quiesce
   )
 where
 
@@ -29,7 +31,7 @@ import           Control.Arrow               ((>>>))
 import           Control.Concurrent          (ThreadId, forkIO)
 import           Control.Concurrent.STM      (STM, modifyTVar, modifyTVar',
                                               newTVar, readTVar, readTVarIO,
-                                              retry, writeTVar)
+                                              retry, writeTVar, orElse, check, TMVar, newTMVarIO, takeTMVar, putTMVar, isEmptyTMVar)
 import qualified Control.Concurrent.STM
 import           Control.Concurrent.STM.TVar (TVar, newTVarIO)
 import           Control.Monad               (forM_, unless, when)
@@ -56,6 +58,10 @@ import           Numeric.Natural             (Natural)
 import           Prelude                     hiding (min)
 import           Text.Printf
 import           Unsafe.Coerce               (unsafeCoerce)
+import qualified Data.Semigroup as MinQ
+import qualified Data.Map.Strict as Map
+import Control.Monad.Fix (MonadFix)
+import Control.Concurrent.STM.TSem (TSem, newTSem, waitTSem, signalTSem)
 
 newtype VertexID = VertexID Int deriving (Eq, Ord, Show)
 
@@ -75,7 +81,8 @@ instance Hashable Timestamp where
 -- takes 'a's as its input.
 --
 -- @since 0.1.0.0
-data Edge a = forall b. Show b => Edge (a -> b) VertexID
+data Edge a = forall b. (Eq b, Show b) => Edge (a -> b) VertexID
+newtype VertexReference a = VertexReference VertexID deriving Show
 
 instance Contravariant Edge where
   contramap f (Edge g vid) = Edge (g . f) vid
@@ -96,27 +103,21 @@ instance Incrementable Epoch where
 
 data DataflowState = DataflowState
   { dfsVertices           :: Vector Any,
-    dfsLastVertexID       :: VertexID,
-    dfsTimestampCounts    :: TVar (Map Timestamp Natural),
-    dfsTimestampProducers :: TVar (Map Timestamp (Set VertexID))
+    dfsLastVertexID       :: VertexID
   }
 
-initDataflowState :: STM DataflowState
-initDataflowState = do
-  dfsTimestampCounts <- newTVar Data.Map.Strict.empty
-  dfsTimestampProducers <- newTVar Data.Map.Strict.empty
-
-  return DataflowState{..}
-
-  where
-    dfsVertices = empty
+initDataflowState :: DataflowState
+initDataflowState =
+  DataflowState{
+    dfsVertices = empty,
     dfsLastVertexID = VertexID (-1)
+  }
 
 -- | `Dataflow` is the type of all dataflow operations.
 --
 -- @since 0.1.0.0
 newtype Dataflow a = Dataflow {runDataflow :: ReaderT (IORef DataflowState) IO a}
-  deriving (Functor, Applicative, Monad)
+  deriving (Functor, Applicative, Monad, MonadFix)
 
 gets :: (DataflowState -> a) -> Dataflow a
 gets f = Dataflow ask >>= readIORef <&> f
@@ -143,30 +144,45 @@ writeIORef ref = Dataflow . liftIO . Data.IORef.writeIORef ref
 modifyIORef' :: IORef a -> (a -> a) -> Dataflow ()
 modifyIORef' ref = Dataflow . liftIO . Data.IORef.modifyIORef' ref
 
-runStatefully :: IORef s -> (s -> Dataflow s) -> Dataflow ()
-runStatefully stateRef action = readIORef stateRef >>= action >>= writeIORef stateRef
+runStatefully :: TVar s -> (s -> Dataflow s) -> Dataflow ()
+runStatefully stateRef action = atomically (readTVar stateRef) >>= action >>= atomically . writeTVar stateRef
 
 data RunState =  Run | Stop deriving (Eq, Show)
 
 data Vertex i = forall s. Vertex {
+    vertexId :: VertexID,
     runState       :: TVar RunState,
-    vertexStateRef :: IORef s,
+    vertexStateRef :: TVar s,
     threadId       :: ThreadId,
-    inputQueue     :: TVar (MinPQ.MinPQueue Timestamp i)--,
-    -- notifyQueue    :: TVar (MinQ.MinQueue Timestamp)
+    inputQueue :: TVar (MinPQ.MinPQueue Timestamp i),
+    inProgress :: TSem,
+    destinations :: TVar [VertexID],
+    sourceCount :: TVar Natural,
+    precursors :: TVar (Map Timestamp Natural)
   }
 
-vertex :: Show i => state -> (Timestamp -> i -> state -> Dataflow state) -> (Timestamp -> state -> Dataflow state) -> Dataflow (Edge i)
-vertex initialState onSend onNotify = do
-  timestampCounters <- gets dfsTimestampCounts
-  timestampProducers <- gets dfsTimestampProducers
+data VertexOperation i = Receive Timestamp i | Notify Timestamp deriving (Show, Eq)
 
+instance Eq i => Ord (VertexOperation i) where
+  compare (Receive tsl _) (Receive tsr _) = compare tsl tsr
+  compare (Receive tsr _)  (Notify tsn) = if tsr == tsn then LT else compare tsr tsn
+  compare (Notify tsn)  (Receive tsr _) = if tsn == tsr then GT else compare tsn tsr
+  compare (Notify tsl) (Notify tsr) = compare tsl tsr
+
+vertex :: forall i state. (Show i, Eq i) => state -> (Timestamp -> i -> state -> Dataflow state) -> (Timestamp -> state -> Dataflow state) -> Dataflow (VertexReference i)
+vertex initialState onRecv onNotify = do
   runState <- Dataflow . liftIO $ newTVarIO Run
-  vertexStateRef <- Dataflow . liftIO $ Data.IORef.newIORef initialState
-  inputQueue <- Dataflow . liftIO $ newTVarIO MinPQ.empty
-  notifyQueue <- Dataflow . liftIO $ newTVarIO MinQ.empty
+
+  vertexStateRef <- Dataflow . liftIO $ newTVarIO initialState
+  inputQueue <- Dataflow . liftIO $ newTVarIO (MinPQ.empty :: MinPQ.MinPQueue Timestamp i)
+  inProgress <- atomically $ newTSem 1
+  destinations <- Dataflow . liftIO $ newTVarIO []
+  sourceCount <- Dataflow . liftIO $ newTVarIO 0
+  precursors <- Dataflow . liftIO $ newTVarIO Map.empty
 
   vertexId <- gets (dfsLastVertexID >>> inc)
+
+  -- traceM $ printf "creating vertex %s" (show vertexId)
 
   vtx <- do
     threadId <- forkDataflow $ do
@@ -179,64 +195,62 @@ vertex initialState onSend onNotify = do
 
         -- traceM $ printf "%s: Loop %d started!" (show vertexId) loopCount
 
-        (mbWorkUnit, mbFinishedTimestamp) <- atomically $ do
-          iq <- readTVar inputQueue
-          nq <- readTVar notifyQueue
+        op <- atomically $ do
+            precursorTable <- readTVar precursors
+            opQueue <- readTVar inputQueue
+            (
+              case MinPQ.minViewWithKey opQueue of
+                Nothing -> do
+                  -- traceM $ printf "%s: loop %d retrying on operationQueue" (show vertexId) loopCount
+                  retry
+                Just ((timestamp, item), opQueue') -> do
+                  -- traceM $ printf "%s: loop continuing with %s / %s" (show vertexId) (show timestamp) (show item)
+                  writeTVar inputQueue opQueue'
+                  waitTSem inProgress
+                  return $ Receive timestamp item
+              ) `orElse` (
+              case Data.Map.Strict.minViewWithKey precursorTable of
+                Just ((timestamp, 0), precursorQueue') -> do
+                  -- traceM $ printf "%s: loop continuing by retiring %s" (show vertexId) (show timestamp)
+                  writeTVar precursors precursorQueue'
+                  waitTSem inProgress
+                  return $ Notify timestamp
+                _ -> do
+                  -- traceM $ printf "%s: loop %d retrying on precurosrs" (show vertexId) loopCount
+                  retry
+              )
 
-          if MinPQ.null iq && MinQ.null nq then do
-            -- traceM $ printf "%s: loop %d retrying" (show vertexId) loopCount
-            retry
-          else
-            return ()
-            -- traceM $ printf "%s: loop continuing" (show vertexId)
 
-          -- traceM "inputQueue ==v"
-          -- traceShowM iq
-          -- traceM "inputQueue ==^"
+        -- traceShowM op
 
-          case (MinPQ.minViewWithKey iq, MinQ.minView nq) of
-            (Nothing, Nothing) ->
-              return (Nothing, Nothing)
-            (Nothing, Just (finishedTimestamp, nq')) -> do
-              writeTVar notifyQueue nq'
-              return (Nothing, Just finishedTimestamp)
-            (Just (workUnit, iq'), Nothing) -> do
-              writeTVar inputQueue iq'
-              return (Just workUnit, Nothing)
-            (Just ((timestamp, i), iq'), Just (finishedTimestamp, nq')) ->
-              if timestamp > finishedTimestamp then do
-                writeTVar inputQueue iq'
-                writeTVar notifyQueue nq'
-                return (Just (timestamp, i), Just finishedTimestamp)
-              else do
-                writeTVar inputQueue iq'
-                return (Just (timestamp, i), Nothing)
+        case op of
+          Receive timestamp item -> do
+            -- traceM $ printf "%s: running onSend for %s / %s" (show vertexId) (show timestamp) (show item)
+            runStatefully vertexStateRef $ onRecv timestamp item
+            atomically $ signalTSem inProgress
 
-        traceM $ printf "%s: %s" (show vertexId) (show (mbWorkUnit, mbFinishedTimestamp))
+          Notify timestamp -> do
+            destinationVertexIDs <- atomically (readTVar destinations)
 
-        case (mbWorkUnit, mbFinishedTimestamp) of
-          (Nothing, Nothing) -> return ()
-          (Just (timestamp, item), Nothing) -> do
-            traceM $ printf "%s: running onSend for %s / %s" (show vertexId) (show timestamp) (show item)
-            runStatefully vertexStateRef $ onSend timestamp item
-          (Nothing, Just finishedTimestamp) -> do
-            traceM $ printf "%s: running onNotify for %s" (show vertexId) (show finishedTimestamp)
-            runStatefully vertexStateRef $ onNotify finishedTimestamp
-          (Just (timestamp, item), Just finishedTimestamp) -> do
-            traceM $ printf "%s: running onNotify for %s" (show vertexId) (show finishedTimestamp)
-            runStatefully vertexStateRef $ onNotify finishedTimestamp
-            traceM $ printf "%s: running onSend for %s / %s" (show vertexId) (show timestamp) (show item)
-            runStatefully vertexStateRef $ onSend timestamp item
+            -- traceM $ printf "%s: running onNotify for %s" (show vertexId) (show timestamp)
+            runStatefully vertexStateRef $ onNotify timestamp
+
+            forM_ destinationVertexIDs (decrementPrecursors timestamp)
+            atomically $ signalTSem inProgress
 
         -- traceM $ printf "%s: Loop %d completed!" (show vertexId) loopCount
         modifyIORef' loopCountRef (+ 1)
 
     return Vertex{..}
 
+  -- traceM $ printf "created vertex %s" (show vertexId)
+
   vertices <- gets (dfsVertices >>> (`snoc` unsafeCoerce vtx))
   modify (\s -> s { dfsVertices = vertices, dfsLastVertexID = vertexId })
 
-  return (Edge id vertexId)
+  -- traceM $ printf "registered vertex %s" (show vertexId)
+
+  return (VertexReference vertexId)
 
     where
       while :: TVar a -> (a -> Bool) -> Dataflow () -> Dataflow ()
@@ -246,41 +260,83 @@ vertex initialState onSend onNotify = do
           action
           while stateVar predicate action
 
+      decrementPrecursors :: Timestamp -> VertexID -> Dataflow ()
+      decrementPrecursors timestamp (VertexID vid) = do
+        Vertex{..} <- gets (dfsVertices >>> (! vid) >>> unsafeCoerce)
+
+        atomically $ modifyTVar' precursors (Data.Map.Strict.adjust (\x -> x - 1) timestamp)
+
+
+
+connect :: (Eq a, Show a) => VertexReference s -> VertexReference a -> Dataflow (Edge a)
+connect source destination = do
+  -- traceM $ printf "connecting vertex %s -> %s: started" (show source) (show destination)
+  (vtxSource :: Vertex s) <- lookupVertex source
+  (vtxDestination :: Vertex a) <- lookupVertex destination
+
+  -- traceM $ printf "connecting vertex %s -> %s: looked up vertices" (show source) (show destination)
+
+  atomically $ do
+    modifyTVar' (destinations vtxSource) (vertexId vtxDestination :)
+    modifyTVar' (sourceCount vtxDestination) (+1)
+
+  -- traceM $ printf "connecting vertex %s -> %s: connected inputs and outputs" (show source) (show destination)
+
+  return (Edge id (vertexId vtxDestination))
+
+lookupVertex :: VertexReference i -> Dataflow (Vertex i)
+lookupVertex (VertexReference (VertexID vid)) = gets (dfsVertices >>> (! vid) >>> unsafeCoerce)
+
 send :: Show i => Edge i -> Timestamp -> i -> Dataflow ()
 send (Edge f vid@(VertexID vindex)) timestamp i = do
-  -- traceM $ printf "sending %s to %s" (show i) (show vid)
+  -- traceM $ printf "sending %s / %s to %s" (show timestamp) (show i) (show vid)
   (vtx :: Vertex b) <- gets (dfsVertices >>> (! vindex) >>> unsafeCoerce)
-  timestampCounters <- gets dfsTimestampCounts
   -- traceM $ printf "send to %s: loaded vertex" (show vid)
 
   atomically $ do
     modifyTVar' (inputQueue vtx) (MinPQ.insert timestamp (f i))
-    modifyTVar' timestampCounters (Data.Map.Strict.adjust (+1) timestamp)
     -- traceM $ printf "send to %s: updated vertex input queue" (show vid)
     -- iq <- readTVar (inputQueue vtx)
-    -- traceM $ printf "send to %s: input queue: %s" (show vid) (show iq)
+    -- traceM $ printf "send to %s %s: input queue: %s" (show vid) (show timestamp) (show iq)
 
--- drain :: Dataflow()
--- drain = do
---   (vertices :: Vector (Vertex Void)) <- gets (dfsVertices >>> unsafeCoerce)
+input :: (Eq i, Show i, Show (t i), Traversable t) => VertexReference i -> Timestamp -> t i -> Dataflow ()
+input vertexRef timestamp items = do
+  -- traceM (show timestamp ++ " -> looking up: " ++ show vertexRef)
 
---   forM_ vertices $ \vtx ->
---     atomically $ do
---       nq <- readTVar (notifyQueue vtx)
---       unless (MinQ.null nq) retry
+  destination <- lookupVertex vertexRef
 
-input :: (Show i, Show (t i), Traversable t) => Edge i -> Timestamp -> t i -> Dataflow ()
-input edge timestamp items = do
-  timestampCounters <- gets dfsTimestampCounts
-  timestampProducers <- gets dfsTimestampProducers
-  (VertexID maxVertexIdx) <- gets dfsLastVertexID
+  -- traceM (show timestamp ++ " -> inputting: " ++ show items)
+  forM_ items $ \item -> do
+    atomically $ do
+      modifyTVar' (inputQueue destination) (MinPQ.insert timestamp item)
+      -- iq <- readTVar (inputQueue destination)
+      -- traceM $ printf "input to %s %s: input queue: %s" (show $ vertexId destination) (show timestamp) (show iq)
 
-  let vertexIds = Data.Set.fromList $ map VertexID [0..maxVertexIdx]
+  allVertices <- fmap unsafeCoerce <$> gets dfsVertices
 
   atomically $ do
-    modifyTVar' timestampCounters (Data.Map.Strict.insert timestamp 0)
-    modifyTVar' timestampProducers (Data.Map.Strict.insert timestamp vertexIds)
+    forM_ allVertices $ \Vertex{..} -> do
+      precursorTable <- readTVar precursors
 
-  traceM (show timestamp ++ " -> inputting: " ++ show items)
-  forM_ items $ send edge timestamp
-  traceM (show timestamp ++ " -> inputted: " ++ show items)
+      unless (timestamp `Data.Map.Strict.member` precursorTable) $ do
+        numSources <- readTVar sourceCount
+        -- traceM $ printf "%s: adding %s to the precursor table with count %d" (show vertexId) (show timestamp) numSources
+        modifyTVar' precursors (Data.Map.Strict.insert timestamp numSources)
+
+  -- traceM (show timestamp ++ " -> inputted: " ++ show items)
+
+quiesce :: Dataflow ()
+quiesce = do
+  allVertices <- fmap unsafeCoerce <$> gets dfsVertices
+
+  atomically $ do
+    forM_ allVertices $ \Vertex{..} -> do
+      synchronizeTSem inProgress
+
+      precursorTable <- readTVar precursors
+      inputs <- readTVar inputQueue
+
+      check (MinPQ.null inputs)
+      check (Data.Map.Strict.null precursorTable)
+  where
+    synchronizeTSem tsem = waitTSem tsem >> signalTSem tsem
