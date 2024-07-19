@@ -2,12 +2,8 @@
 
 module Dataflow.OperatorsSpec (spec) where
 
-import           Data.Functor.Identity (Identity (..))
-import           Data.Semigroup        (Sum (..))
-import           Dataflow
-import           Dataflow.Operators
+import           Dataflow.Operators    (fanout, fold)
 import           Prelude               hiding (map)
-import qualified Prelude               (map)
 
 import           Test.Dataflow         (runDataflow)
 import           Test.Hspec
@@ -18,9 +14,15 @@ spec :: Spec
 spec = do
   describe "fanout" $
     it "sends all input to each output" $ property $ do
-      \(numbers :: [Int]) -> numbers `shouldBe` numbers
-      -- let fanout' next = fanout [next, next, next]
+      let fanout' next = fanout [next, next, next]
 
-      -- \(numbers :: [Int]) -> do
-      --   actual <- runDataflow fanout' numbers
-      --   actual `shouldMatchList` (numbers <> numbers <> numbers)
+      \(numbers :: [Int]) -> do
+        actual <- runDataflow fanout' numbers
+        actual `shouldMatchList` (numbers <> numbers <> numbers)
+
+  describe "fold" $
+    it "collects data and emits it at the end" $ property $ do
+      \(numbers :: [Int]) -> do
+        let summate = fold 0 (+) id
+
+        runDataflow summate numbers `shouldReturn` [sum numbers]

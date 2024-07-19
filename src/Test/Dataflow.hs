@@ -4,19 +4,14 @@ module Test.Dataflow
   )
 where
 
-import           Control.Concurrent          (threadDelay)
-import           Control.Concurrent.STM.TVar (modifyTVar', newTVarIO, readTVar,
+import           Control.Concurrent.STM.TVar (modifyTVar', newTVarIO,
                                               readTVarIO)
 import           Control.Monad               (foldM_)
 import           Control.Monad.IO.Class      (MonadIO (..))
-import           Control.Monad.Trans.Class   (lift)
-import           Dataflow                    (Edge, compile, execute, VertexReference,
-                                              programLastTimestamp, send, synchronize)
-import           Dataflow.Primitives         (Dataflow (Dataflow), atomically,
-                                               vertex, quiesce)
-import           Debug.Trace                 (traceM, traceShowM)
+import           Dataflow                    (compile, execute, VertexReference, synchronize, Dataflow)
+import           Dataflow.Primitives         (atomically,
+                                               vertex)
 import           Prelude
-import Text.Printf (printf)
 
 -- | Run a dataflow with a list of inputs. All inputs will be sent as part of
 -- a single epoch.
@@ -42,13 +37,6 @@ runDataflowMany dataflow inputs =
     readTVarIO out
   where
     outputTVarNestedList register =
-        vertex
-        []
-        (\_ x state -> do
-          -- traceM (printf "adding %s to state %s -> %s" (show x) (show state) (show $ x : state))
-          return (x : state))
-        ( \_ state -> do
-            -- traceM ("state to latch: " ++ show state)
-            atomically $ modifyTVar' register (state :)
-            return []
-        )
+        vertex []
+        (\_ x state -> return (x : state))
+        ( \_ state -> atomically $ modifyTVar' register (state :) >> return [])

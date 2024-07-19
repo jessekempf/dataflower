@@ -48,8 +48,18 @@ benchmarks:
   performance:
     main: Main.hs
     source-dirs: benchmark
+    ghc-options:
+      - -O2
     dependencies:
       - dataflower
       - criterion
       - stm
-    ghc-options: -O2
+
+executables:
+  noop:
+    main: Noop.hs
+    source-dirs: examples
+    ghc-options:
+      - -rtsopts -O2
+    dependencies:
+      - dataflower
