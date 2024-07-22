@@ -4,6 +4,8 @@
 {-# LANGUAGE RankNTypes                 #-}
 {-# LANGUAGE RecordWildCards            #-}
 {-# LANGUAGE ScopedTypeVariables        #-}
+{-# OPTIONS_GHC -Wno-unrecognised-pragmas #-}
+{-# HLINT ignore "Use readTVarIO" #-}
 
 
 module Dataflow.Primitives
@@ -15,7 +17,6 @@ module Dataflow.Primitives
     Edge,
     Epoch (..),
     Timestamp (..),
-    modifyIORef',
     atomically,
     inc,
     send,
@@ -44,8 +45,6 @@ import           Control.Monad.Reader        (MonadReader (ask),
 import           Data.Functor                ((<&>))
 import           Data.Functor.Contravariant  (Contravariant (contramap))
 import           Data.Hashable               (Hashable (..))
-import           Data.IORef                  (IORef)
-import qualified Data.IORef
 import           Data.Map.Strict             (Map)
 import qualified Data.Map.Strict
 import qualified Data.Map.Strict             as Map
@@ -110,14 +109,16 @@ initDataflowState =
 -- | `Dataflow` is the type of all dataflow operations.
 --
 -- @since 0.1.0.0
-newtype Dataflow a = Dataflow {runDataflow :: ReaderT (IORef DataflowState) IO a}
+newtype Dataflow a = Dataflow {runDataflow :: ReaderT (TVar DataflowState) IO a}
   deriving (Functor, Applicative, Monad, MonadFix)
 
+newtype Node a = Node { runNode :: ReaderT (TVar DataflowState) STM a}
+
 gets :: (DataflowState -> a) -> Dataflow a
-gets f = Dataflow ask >>= readIORef <&> f
+gets f = Dataflow ask >>= atomically . readTVar <&> f
 
 modify :: (DataflowState -> DataflowState) -> Dataflow ()
-modify f = Dataflow ask >>= \r -> modifyIORef' r f
+modify f = Dataflow ask >>= \r -> atomically (modifyTVar' r f)
 
 forkDataflow :: Dataflow () -> Dataflow ThreadId
 forkDataflow action = Dataflow $ do
@@ -128,12 +129,6 @@ forkDataflow action = Dataflow $ do
 
 atomically :: STM a -> Dataflow a
 atomically = Dataflow . liftIO . Control.Concurrent.STM.atomically
-
-readIORef :: IORef a -> Dataflow a
-readIORef = Dataflow . liftIO . Data.IORef.readIORef
-
-modifyIORef' :: IORef a -> (a -> a) -> Dataflow ()
-modifyIORef' ref = Dataflow . liftIO . Data.IORef.modifyIORef' ref
 
 runStatefully :: TVar s -> (s -> Dataflow s) -> Dataflow ()
 runStatefully stateRef action = (Dataflow . liftIO $ readTVarIO stateRef) >>= action >>= atomically . writeTVar stateRef

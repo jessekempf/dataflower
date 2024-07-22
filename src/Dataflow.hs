@@ -28,10 +28,9 @@ module Dataflow (
   outputSTM,
 ) where
 
-import           Control.Concurrent.STM (STM)
+import           Control.Concurrent.STM (STM, newTVarIO, TVar)
 import           Control.Monad.IO.Class (MonadIO (..))
 import           Control.Monad.Reader   (ReaderT (runReaderT))
-import           Data.IORef             (IORef, newIORef)
 import qualified Data.Map.Strict
 import           Dataflow.Primitives
 
@@ -42,7 +41,7 @@ import           Dataflow.Primitives
 data Program i = Program {
   programInput     :: VertexReference i,
   programLastEpoch :: Epoch,
-  programState     :: IORef DataflowState
+  programState     :: TVar DataflowState
 }
 
 -- | Take a 'Dataflow' which takes 'i's as input and compile it into a 'Program'.
@@ -50,7 +49,7 @@ data Program i = Program {
 -- @since 0.1.0.0
 compile :: MonadIO io => Dataflow (VertexReference i) -> io (Program i)
 compile (Dataflow actions) = liftIO $ do
-  stateRef <- newIORef initDataflowState
+  stateRef <- newTVarIO initDataflowState
   edge <- runReaderT actions stateRef
   return $ Program edge (Epoch 0) stateRef
 
