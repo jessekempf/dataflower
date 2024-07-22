@@ -22,8 +22,7 @@ module Dataflow.Operators (
 ) where
 
 import           Control.Monad       (forM_)
-import           Data.Map.Strict     (Map, alter, delete, empty, lookup)
-import           Data.Maybe          (fromMaybe)
+import           Data.Map.Strict     (Map, delete, empty, findWithDefault, insert)
 import           Dataflow.Primitives (Dataflow, Timestamp, VertexReference,
                                       connect, send, vertex)
 
@@ -32,25 +31,31 @@ import           Dataflow.Primitives (Dataflow, Timestamp, VertexReference,
 -- @since 0.1.3.0
 fanout :: (Eq i, Show i) => [VertexReference i] -> Dataflow (VertexReference i)
 fanout nextVertices = mdo
-  inputVertex <- vertex () (\timestamp a _ -> forM_ nexts (\next -> send next timestamp a)) (\_ _ -> return ())
+  inputVertex <- statelessVertex (\timestamp a -> forM_ nexts (\next -> send next timestamp a))
   nexts <- mapM (connect inputVertex) nextVertices
   return inputVertex
 
 fold :: (Eq i, Show i, Eq o, Show o, Show state) => state -> (i -> state -> state) -> (state -> o) -> VertexReference o -> Dataflow (VertexReference i)
 fold zeroState accumulate output nextVertex = mdo
-  inputVertex <- vertex (empty :: Map Timestamp state)
-                    (\timestamp i stateMap -> do
-                      let stateMap' = Data.Map.Strict.alter (\case
-                                                        Nothing -> Just (accumulate i zeroState)
-                                                        Just state -> Just (accumulate i state)
-                                                    ) timestamp stateMap
-                      return stateMap'
-                    ) (\timestamp stateMap -> do
-                          send next timestamp (output $ fromMaybe zeroState (Data.Map.Strict.lookup timestamp stateMap))
-                          return $ Data.Map.Strict.delete timestamp stateMap
-                      )
+  inputVertex <- statefulVertex zeroState
+    (\_ i state -> return (accumulate i state))
+    (\timestamp state -> send next timestamp (output state))
   next <- connect inputVertex nextVertex
   return inputVertex
 
 mcollect :: (Eq a, Show a, Monoid a) => VertexReference a -> Dataflow (VertexReference a)
 mcollect = fold mempty mappend id
+
+statelessVertex :: (Eq i, Show i) => (Timestamp -> i -> Dataflow()) -> Dataflow (VertexReference i)
+statelessVertex onRecv = vertex () (\t i _ -> onRecv t i) (\_ _ -> return ())
+
+statefulVertex :: (Eq i, Show i) => state -> (Timestamp -> i -> state -> Dataflow state) -> (Timestamp -> state -> Dataflow ()) -> Dataflow (VertexReference i)
+statefulVertex zeroState onRecv onNotify =
+  vertex (empty :: Map Timestamp state)
+    (\t i stateMap -> do
+      state' <- onRecv t i (Data.Map.Strict.findWithDefault zeroState t stateMap)
+      return $ Data.Map.Strict.insert t state' stateMap
+    ) (\t stateMap -> do
+      onNotify t (Data.Map.Strict.findWithDefault zeroState t stateMap)
+      return $ Data.Map.Strict.delete t stateMap
+    )

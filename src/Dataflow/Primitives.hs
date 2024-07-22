@@ -246,14 +246,14 @@ lookupVertex (VertexReference (VertexID vid)) = do
 
 {-# INLINE send #-}
 send :: Show i => Edge i -> Timestamp -> i -> Dataflow ()
-send (Direct vid@(VertexID vindex)) timestamp i = do
+send (Direct (VertexID vindex)) timestamp i = do
   vertices <- gets dfsVertices
   let vtx = inline (unsafeCoerce (vertices `unsafeIndex` vindex))
 
   atomically $ do
     writeTQueue (inputQueue vtx) (timestamp, i)
 
-send (Contra f vid@(VertexID vindex)) timestamp i = do
+send (Contra f (VertexID vindex)) timestamp i = do
   vertices <- gets dfsVertices
   let vtx = inline (unsafeCoerce (vertices `unsafeIndex` vindex))
 
