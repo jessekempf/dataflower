@@ -114,9 +114,11 @@ newtype Dataflow a = Dataflow {runDataflow :: ReaderT (TVar DataflowState) IO a}
 
 newtype Node a = Node { runNode :: ReaderT (TVar DataflowState) STM a}
 
+{-# INLINE gets #-}
 gets :: (DataflowState -> a) -> Dataflow a
-gets f = Dataflow ask >>= atomically . readTVar <&> f
+gets f = Dataflow ask >>= Dataflow . liftIO . readTVarIO <&> f
 
+{-# INLINE modify #-}
 modify :: (DataflowState -> DataflowState) -> Dataflow ()
 modify f = Dataflow ask >>= \r -> atomically (modifyTVar' r f)
 
@@ -127,9 +129,11 @@ forkDataflow action = Dataflow $ do
   liftIO . forkIO $
     runReaderT (runDataflow action) stateRef
 
+{-# INLINE atomically #-}
 atomically :: STM a -> Dataflow a
 atomically = Dataflow . liftIO . Control.Concurrent.STM.atomically
 
+{-# INLINE runStatefully #-}
 runStatefully :: TVar s -> (s -> Dataflow s) -> Dataflow ()
 runStatefully stateRef action = (Dataflow . liftIO $ readTVarIO stateRef) >>= action >>= atomically . writeTVar stateRef
 
