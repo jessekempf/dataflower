@@ -10,8 +10,9 @@ import           Control.Monad               (foldM_)
 import           Control.Monad.IO.Class      (MonadIO (..))
 import           Dataflow                    (compile, execute, VertexReference, synchronize, Dataflow)
 import           Dataflow.Primitives         (atomically,
-                                               vertex)
+                                               vertex, Node (Node))
 import           Prelude
+import Control.Monad.Trans (MonadTrans(..))
 
 -- | Run a dataflow with a list of inputs. All inputs will be sent as part of
 -- a single epoch.
@@ -39,4 +40,4 @@ runDataflowMany dataflow inputs =
     outputTVarNestedList register =
         vertex []
         (\_ x state -> return (x : state))
-        ( \_ state -> atomically $ modifyTVar' register (state :) >> return [])
+        ( \_ state -> Node . lift $ modifyTVar' register (state :) >> return [])

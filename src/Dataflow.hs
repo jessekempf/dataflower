@@ -14,6 +14,7 @@ Timely Dataflow in pure Haskell.
 
 module Dataflow (
   Dataflow,
+  Node,
   Edge,
   Timestamp,
   send,
@@ -33,6 +34,7 @@ import           Control.Monad.IO.Class (MonadIO (..))
 import           Control.Monad.Reader   (ReaderT (runReaderT))
 import qualified Data.Map.Strict
 import           Dataflow.Primitives
+import Control.Monad.Trans (MonadTrans(..))
 
 -- | A 'Program' represents a fully-preprocessed 'Dataflow' that may be
 -- executed against inputs.
@@ -82,6 +84,6 @@ outputSTM stmAction =
                                       Just accum -> Just (o : accum)
                                     ) timestamp state
   )(\timestamp state -> do
-      atomically (stmAction $ state Data.Map.Strict.! timestamp)
+      Node . lift $ stmAction $ state Data.Map.Strict.! timestamp
       return $ Data.Map.Strict.delete timestamp state
   )

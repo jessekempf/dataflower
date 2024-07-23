@@ -6,10 +6,12 @@
 {-# LANGUAGE ScopedTypeVariables        #-}
 {-# OPTIONS_GHC -Wno-unrecognised-pragmas #-}
 {-# HLINT ignore "Use readTVarIO" #-}
+{-# LANGUAGE InstanceSigs               #-}
 
 
 module Dataflow.Primitives
   ( Dataflow (..),
+    Node(..),
     DataflowState,
     Vertex (..),
     VertexReference,
@@ -32,17 +34,17 @@ import           Control.Concurrent          (ThreadId, forkIO)
 import           Control.Concurrent.STM      (STM, TQueue, check, isEmptyTQueue,
                                               modifyTVar', newTQueueIO, orElse,
                                               readTQueue, readTVar, readTVarIO,
-                                              retry, writeTQueue, writeTVar)
+                                              retry, stateTVar, writeTQueue,
+                                              writeTVar)
 import qualified Control.Concurrent.STM
-import           Control.Concurrent.STM.TSem (TSem, newTSem, signalTSem,
-                                              waitTSem)
 import           Control.Concurrent.STM.TVar (TVar, newTVarIO)
 import           Control.Monad               (forM_, unless, when)
 import           Control.Monad.Fix           (MonadFix)
 import           Control.Monad.IO.Class      (liftIO)
 import           Control.Monad.Reader        (MonadReader (ask),
+                                              MonadTrans (lift),
                                               ReaderT (runReaderT))
-import           Data.Functor                ((<&>))
+import           Control.Monad.State         (MonadState (state), gets, modify)
 import           Data.Functor.Contravariant  (Contravariant (contramap))
 import           Data.Hashable               (Hashable (..))
 import           Data.Map.Strict             (Map)
@@ -52,7 +54,7 @@ import           Data.Vector                 (Vector, empty, snoc, unsafeIndex,
                                               (!))
 import           GHC.Exts                    (Any, inline)
 import           Numeric.Natural             (Natural)
-import           Prelude                     hiding (min)
+import           Prelude                     hiding (min, (<>))
 import           Unsafe.Coerce               (unsafeCoerce)
 
 newtype VertexID = VertexID Int deriving (Eq, Ord, Show)
@@ -73,7 +75,7 @@ instance Hashable Timestamp where
 -- takes 'a's as its input.
 --
 -- @since 0.1.0.0
-data Edge a = (Eq a, Show a) => Direct {-# UNPACK #-} VertexID | forall b. (Eq b, Show b) => Contra (a -> b) VertexID
+data Edge a = (Eq a, Show a) => Direct {-# UNPACK #-} VertexID | forall b. (Eq b, Show b) => Contra {-# UNPACK #-} (a -> b) {-# UNPACK #-} VertexID
 newtype VertexReference a = VertexReference VertexID deriving Show
 
 instance Contravariant Edge where
@@ -112,15 +114,21 @@ initDataflowState =
 newtype Dataflow a = Dataflow {runDataflow :: ReaderT (TVar DataflowState) IO a}
   deriving (Functor, Applicative, Monad, MonadFix)
 
-newtype Node a = Node { runNode :: ReaderT (TVar DataflowState) STM a}
+instance MonadState DataflowState Dataflow where
+  state :: (DataflowState -> (a, DataflowState)) -> Dataflow a
+  state action = do
+    dataflowStateRef <- Dataflow ask
+    atomically $ stateTVar dataflowStateRef action
 
-{-# INLINE gets #-}
-gets :: (DataflowState -> a) -> Dataflow a
-gets f = Dataflow ask >>= Dataflow . liftIO . readTVarIO <&> f
+newtype Node a = Node (ReaderT (TVar DataflowState) STM a)
+  deriving (Functor, Applicative, Monad, MonadFix)
 
-{-# INLINE modify #-}
-modify :: (DataflowState -> DataflowState) -> Dataflow ()
-modify f = Dataflow ask >>= \r -> atomically (modifyTVar' r f)
+instance MonadState DataflowState Node where
+  state :: (DataflowState -> (a, DataflowState)) -> Node a
+  state action = do
+    dataflowStateRef <- Node ask
+    Node . lift $ stateTVar dataflowStateRef action
+
 
 forkDataflow :: Dataflow () -> Dataflow ThreadId
 forkDataflow action = Dataflow $ do
@@ -134,8 +142,21 @@ atomically :: STM a -> Dataflow a
 atomically = Dataflow . liftIO . Control.Concurrent.STM.atomically
 
 {-# INLINE runStatefully #-}
-runStatefully :: TVar s -> (s -> Dataflow s) -> Dataflow ()
-runStatefully stateRef action = (Dataflow . liftIO $ readTVarIO stateRef) >>= action >>= atomically . writeTVar stateRef
+runStatefully :: TVar s -> (s -> Node s) -> Node ()
+runStatefully stateRef action = Node (lift $ readTVar stateRef) >>= action >>= Node . lift . writeTVar stateRef
+
+{-# INLINE runNodeAtomically #-}
+runNodeAtomically :: Node a -> Dataflow a
+runNodeAtomically (Node stmActions) = do
+  stateRef <- Dataflow ask
+  atomically (runReaderT stmActions stateRef)
+
+{-# INLINE (<>) #-}
+(<>) :: Node a -> Node a -> Node a
+(Node first) <> (Node second) = Node $ do
+  stateRef <- ask
+
+  lift (runReaderT first stateRef `orElse` runReaderT second stateRef)
 
 data RunState =  Run | Stop deriving (Eq, Show)
 
@@ -145,27 +166,17 @@ data Vertex i = forall s. Vertex {
     vertexStateRef :: TVar s,
     threadId       :: ThreadId,
     inputQueue     :: TQueue (Timestamp, i),
-    inProgress     :: TSem,
     destinations   :: TVar [VertexID],
     sourceCount    :: TVar Natural,
     precursors     :: TVar (Map Timestamp Natural)
   }
 
-data VertexOperation i = Receive Timestamp i | Notify Timestamp deriving (Show, Eq)
-
-instance Eq i => Ord (VertexOperation i) where
-  compare (Receive tsl _) (Receive tsr _) = compare tsl tsr
-  compare (Receive tsr _)  (Notify tsn) = if tsr == tsn then LT else compare tsr tsn
-  compare (Notify tsn)  (Receive tsr _) = if tsn == tsr then GT else compare tsn tsr
-  compare (Notify tsl) (Notify tsr) = compare tsl tsr
-
-vertex :: forall i state. (Show i, Eq i) => state -> (Timestamp -> i -> state -> Dataflow state) -> (Timestamp -> state -> Dataflow state) -> Dataflow (VertexReference i)
+vertex :: forall i state. (Show i, Eq i) => state -> (Timestamp -> i -> state -> Node state) -> (Timestamp -> state -> Node state) -> Dataflow (VertexReference i)
 vertex initialState onRecv onNotify = do
   runState <- Dataflow . liftIO $ newTVarIO Run
 
   vertexStateRef <- Dataflow . liftIO $ newTVarIO initialState
   inputQueue <- Dataflow . liftIO $ newTQueueIO
-  inProgress <- atomically $ newTSem 1
   destinations <- Dataflow . liftIO $ newTVarIO []
   sourceCount <- Dataflow . liftIO $ newTVarIO 0
   precursors <- Dataflow . liftIO $ newTVarIO Map.empty
@@ -175,33 +186,21 @@ vertex initialState onRecv onNotify = do
   vtx <- do
     threadId <- forkDataflow $ do
       while runState (== Run) $ do
-        op <- atomically $
-            (do
-                (ts, i) <- readTQueue inputQueue
-                waitTSem inProgress
-                return $ Receive ts i
-              ) `orElse`
-            (do
+        runNodeAtomically $ (do
+            (ts, i) <- Node . lift $ readTQueue inputQueue
+            runStatefully vertexStateRef $ onRecv ts i
+          ) <> (do
+            timestamp <- Node . lift $ do
               precursorTable <- readTVar precursors
               case Data.Map.Strict.minViewWithKey precursorTable of
                 Just ((timestamp, 0), precursorQueue') -> do
                   writeTVar precursors precursorQueue'
-                  waitTSem inProgress
-                  return $ Notify timestamp
+                  return timestamp
                 _ -> retry
-              )
-
-        case op of
-          Receive timestamp item -> do
-            runStatefully vertexStateRef $ onRecv timestamp item
-            atomically $ signalTSem inProgress
-
-          Notify timestamp -> do
-            destinationVertexIDs <- atomically (readTVar destinations)
+            destinationVertexIDs <- Node . lift $ readTVar destinations
             runStatefully vertexStateRef $ onNotify timestamp
-
             forM_ destinationVertexIDs (decrementPrecursors timestamp)
-            atomically $ signalTSem inProgress
+          )
 
     return Vertex{..}
 
@@ -213,16 +212,15 @@ vertex initialState onRecv onNotify = do
     where
       while :: TVar a -> (a -> Bool) -> Dataflow () -> Dataflow ()
       while stateVar predicate action = do
-        state <- Dataflow . liftIO $ readTVarIO stateVar
-        when (predicate state) $ do
+        condition <- predicate <$> (Dataflow . liftIO $ readTVarIO stateVar)
+        when condition $ do
           action
           while stateVar predicate action
 
-      decrementPrecursors :: Timestamp -> VertexID -> Dataflow ()
+      decrementPrecursors :: Timestamp -> VertexID -> Node ()
       decrementPrecursors timestamp (VertexID vid) = do
         Vertex{..} <- gets (dfsVertices >>> (! vid) >>> unsafeCoerce)
-
-        atomically $ modifyTVar' precursors (Data.Map.Strict.adjust (\x -> x - 1) timestamp)
+        Node . lift $ modifyTVar' precursors (Data.Map.Strict.adjust (\x -> x - 1) timestamp)
 
 
 
@@ -244,20 +242,17 @@ lookupVertex (VertexReference (VertexID vid)) = do
   return $ unsafeCoerce (vertices `unsafeIndex` vid)
 
 {-# INLINE send #-}
-send :: Show i => Edge i -> Timestamp -> i -> Dataflow ()
+send :: Show i => Edge i -> Timestamp -> i -> Node ()
 send (Direct (VertexID vindex)) timestamp i = do
   vertices <- gets dfsVertices
   let vtx = inline (unsafeCoerce (vertices `unsafeIndex` vindex))
 
-  atomically $ do
-    writeTQueue (inputQueue vtx) (timestamp, i)
-
+  Node . lift $ writeTQueue (inputQueue vtx) (timestamp, i)
 send (Contra f (VertexID vindex)) timestamp i = do
   vertices <- gets dfsVertices
   let vtx = inline (unsafeCoerce (vertices `unsafeIndex` vindex))
 
-  atomically $ do
-    writeTQueue (inputQueue vtx) (timestamp, f i)
+  Node . lift $ writeTQueue (inputQueue vtx) (timestamp, f i)
 
 {-# INLINE input #-}
 input :: (Eq i, Show i, Show (t i), Traversable t) => VertexReference i -> Timestamp -> t i -> Dataflow ()
@@ -268,7 +263,7 @@ input vertexRef timestamp items = do
     atomically $ do
       writeTQueue (inputQueue destination) (timestamp, item)
 
-  allVertices <- fmap unsafeCoerce <$> gets dfsVertices
+  allVertices <- gets (fmap unsafeCoerce . dfsVertices)
 
   atomically $ do
     forM_ allVertices $ \Vertex{..} -> do
@@ -281,13 +276,10 @@ input vertexRef timestamp items = do
 {-# INLINE quiesce #-}
 quiesce :: Dataflow ()
 quiesce = do
-  allVertices <- fmap unsafeCoerce <$> gets dfsVertices
+  allVertices <- gets (fmap unsafeCoerce . dfsVertices)
 
   atomically $ do
     forM_ allVertices $ \Vertex{..} -> do
-      synchronizeTSem inProgress
 
       check =<< isEmptyTQueue inputQueue
       check . Data.Map.Strict.null =<< readTVar precursors
-  where
-    synchronizeTSem tsem = waitTSem tsem >> signalTSem tsem

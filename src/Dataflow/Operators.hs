@@ -23,7 +23,7 @@ module Dataflow.Operators (
 
 import           Control.Monad       (forM_)
 import           Data.Map.Strict     (Map, delete, empty, findWithDefault, insert)
-import           Dataflow.Primitives (Dataflow, Timestamp, VertexReference,
+import           Dataflow.Primitives (Dataflow, Timestamp, VertexReference, Node,
                                       connect, send, vertex)
 
 -- | Construct a stateless vertex that sends each input to every 'Edge' in the output list.
@@ -46,10 +46,10 @@ fold zeroState accumulate output nextVertex = mdo
 mcollect :: (Eq a, Show a, Monoid a) => VertexReference a -> Dataflow (VertexReference a)
 mcollect = fold mempty mappend id
 
-statelessVertex :: (Eq i, Show i) => (Timestamp -> i -> Dataflow()) -> Dataflow (VertexReference i)
+statelessVertex :: (Eq i, Show i) => (Timestamp -> i -> Node()) -> Dataflow (VertexReference i)
 statelessVertex onRecv = vertex () (\t i _ -> onRecv t i) (\_ _ -> return ())
 
-statefulVertex :: (Eq i, Show i) => state -> (Timestamp -> i -> state -> Dataflow state) -> (Timestamp -> state -> Dataflow ()) -> Dataflow (VertexReference i)
+statefulVertex :: (Eq i, Show i) => state -> (Timestamp -> i -> state -> Node state) -> (Timestamp -> state -> Node ()) -> Dataflow (VertexReference i)
 statefulVertex zeroState onRecv onNotify =
   vertex (empty :: Map Timestamp state)
     (\t i stateMap -> do
