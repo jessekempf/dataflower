@@ -19,6 +19,7 @@ module Dataflow (
   Timestamp,
   send,
   vertex,
+  inputVertex,
   VertexReference,
   connect,
   Program,
@@ -41,7 +42,7 @@ import Control.Monad.Trans (MonadTrans(..))
 --
 -- @since 0.1.0.0
 data Program i = Program {
-  programInput     :: VertexReference i,
+  programInput     :: Input i,
   programLastEpoch :: Epoch,
   programState     :: TVar DataflowState
 }
@@ -49,7 +50,7 @@ data Program i = Program {
 -- | Take a 'Dataflow' which takes 'i's as input and compile it into a 'Program'.
 --
 -- @since 0.1.0.0
-compile :: MonadIO io => Dataflow (VertexReference i) -> io (Program i)
+compile :: MonadIO io => Dataflow (Input i) -> io (Program i)
 compile (Dataflow actions) = liftIO $ do
   stateRef <- newTVarIO initDataflowState
   edge <- runReaderT actions stateRef

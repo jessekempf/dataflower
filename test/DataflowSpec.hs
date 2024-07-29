@@ -27,7 +27,7 @@ spec = do
   describe "execute" $ do
     it "isolates the state of runs from each other" $ property $ \(NonEmpty numbers) -> do
       out     <- newTVarIO []
-      program <- compile (outputSTM (\(results :: [Int])-> modifyTVar' out (results :)))
+      program <- compile (inputVertex $ outputSTM (\(results :: [Int])-> modifyTVar' out (results :)))
 
       void $ synchronize =<< execute numbers =<< execute numbers program
 
@@ -38,7 +38,7 @@ spec = do
 
     it "bundles all the execution state into a Program" $ property $ \(NonEmpty numbers) -> do
       out     <- newTVarIO 0
-      program <- compile (integrate =<< outputSTM (\results -> modifyTVar' out (+ sum results)))
+      program <- compile ((inputVertex . integrate) =<< outputSTM (\results -> modifyTVar' out (+ sum results)))
 
       void $ execute numbers program >>= execute numbers >>= execute numbers >>= synchronize
 

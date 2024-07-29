@@ -8,8 +8,8 @@ import           Control.Concurrent.STM.TVar (modifyTVar', newTVarIO,
                                               readTVarIO)
 import           Control.Monad               (foldM_)
 import           Control.Monad.IO.Class      (MonadIO (..))
-import           Dataflow                    (compile, execute, VertexReference, synchronize, Dataflow)
-import           Dataflow.Primitives         (atomically,
+import           Dataflow                    (compile, execute, VertexReference, synchronize, Dataflow, inputVertex)
+import           Dataflow.Primitives         (atomically, Input,
                                                vertex, Node (Node))
 import           Prelude
 import Control.Monad.Trans (MonadTrans(..))
@@ -29,7 +29,7 @@ runDataflowMany :: (Eq o, Eq i, Show o, Show i, MonadIO io) => (VertexReference 
 runDataflowMany dataflow inputs =
   liftIO $ do
     out <- newTVarIO []
-    program <- compile (dataflow =<< outputTVarNestedList out)
+    program <- compile (inputVertex . dataflow =<< outputTVarNestedList out)
 
     foldM_ (flip execute) program inputs
 

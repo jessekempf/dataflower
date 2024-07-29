@@ -17,6 +17,7 @@ module Dataflow.Primitives
     VertexReference,
     initDataflowState,
     Edge,
+    Input,
     Epoch (..),
     Timestamp (..),
     atomically,
@@ -25,6 +26,7 @@ module Dataflow.Primitives
     connect,
     vertex,
     input,
+    inputVertex,
     quiesce
   )
 where
@@ -78,6 +80,7 @@ instance Hashable Timestamp where
 data Edge a = (Eq a, Show a) => Direct {-# UNPACK #-} (TQueue (Timestamp, a)) | forall b. (Eq b, Show b) => Mapped {-# UNPACK #-} (a -> b) {-# UNPACK #-} (TQueue (Timestamp, b))
 newtype VertexReference a = VertexReference VertexID deriving Show
 
+newtype Input a = Input (TQueue (Timestamp, a))
 instance Contravariant Edge where
   contramap f (Direct inputQueue)   = Mapped f inputQueue
   contramap f (Mapped g inputQueue) = Mapped (g . f) inputQueue
@@ -222,7 +225,10 @@ vertex initialState onRecv onNotify = do
         Vertex{..} <- gets (dfsVertices >>> (! vid) >>> unsafeCoerce)
         Node . lift $ modifyTVar' precursors (Data.Map.Strict.adjust (\x -> x - 1) timestamp)
 
-
+inputVertex :: Dataflow (VertexReference i) -> Dataflow (Input i)
+inputVertex vref = do
+  vtx <- lookupVertex =<< vref
+  return (Input $ inputQueue vtx)
 
 connect :: (Eq a, Show a) => VertexReference s -> VertexReference a -> Dataflow (Edge a)
 connect source destination = do
@@ -247,13 +253,11 @@ send (Direct inputQueue) timestamp i = Node . lift $ writeTQueue inputQueue (tim
 send (Mapped f inputQueue) timestamp i = Node . lift $ writeTQueue inputQueue (timestamp, f i)
 
 {-# INLINE input #-}
-input :: (Eq i, Show i, Show (t i), Traversable t) => VertexReference i -> Timestamp -> t i -> Dataflow ()
-input vertexRef timestamp items = do
-  destination <- lookupVertex vertexRef
-
+input :: (Eq i, Show i, Show (t i), Traversable t) => Input i -> Timestamp -> t i -> Dataflow ()
+input (Input inputQueue) timestamp items = do
   forM_ items $ \item -> do
     atomically $ do
-      writeTQueue (inputQueue destination) (timestamp, item)
+      writeTQueue inputQueue (timestamp, item)
 
   allVertices <- gets (fmap unsafeCoerce . dfsVertices)
 
