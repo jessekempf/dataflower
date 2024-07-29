@@ -75,12 +75,12 @@ instance Hashable Timestamp where
 -- takes 'a's as its input.
 --
 -- @since 0.1.0.0
-data Edge a = (Eq a, Show a) => Direct {-# UNPACK #-} VertexID | forall b. (Eq b, Show b) => Contra {-# UNPACK #-} (a -> b) {-# UNPACK #-} VertexID
+data Edge a = (Eq a, Show a) => Direct {-# UNPACK #-} (TQueue (Timestamp, a)) | forall b. (Eq b, Show b) => Mapped {-# UNPACK #-} (a -> b) {-# UNPACK #-} (TQueue (Timestamp, b))
 newtype VertexReference a = VertexReference VertexID deriving Show
 
 instance Contravariant Edge where
-  contramap f (Direct vid)   = Contra f vid
-  contramap f (Contra g vid) = Contra (g . f) vid
+  contramap f (Direct inputQueue)   = Mapped f inputQueue
+  contramap f (Mapped g inputQueue) = Mapped (g . f) inputQueue
 
 
 -- | Class of entities that can be incremented by one.
@@ -233,7 +233,7 @@ connect source destination = do
     modifyTVar' (destinations vtxSource) (vertexId vtxDestination :)
     modifyTVar' (sourceCount vtxDestination) (+1)
 
-  return (Direct (vertexId vtxDestination))
+  return (Direct (inputQueue vtxDestination))
 
 {-# INLINE lookupVertex #-}
 lookupVertex :: VertexReference i -> Dataflow (Vertex i)
@@ -243,16 +243,8 @@ lookupVertex (VertexReference (VertexID vid)) = do
 
 {-# INLINE send #-}
 send :: Show i => Edge i -> Timestamp -> i -> Node ()
-send (Direct (VertexID vindex)) timestamp i = do
-  vertices <- gets dfsVertices
-  let vtx = inline (unsafeCoerce (vertices `unsafeIndex` vindex))
-
-  Node . lift $ writeTQueue (inputQueue vtx) (timestamp, i)
-send (Contra f (VertexID vindex)) timestamp i = do
-  vertices <- gets dfsVertices
-  let vtx = inline (unsafeCoerce (vertices `unsafeIndex` vindex))
-
-  Node . lift $ writeTQueue (inputQueue vtx) (timestamp, f i)
+send (Direct inputQueue) timestamp i = Node . lift $ writeTQueue inputQueue (timestamp, i)
+send (Mapped f inputQueue) timestamp i = Node . lift $ writeTQueue inputQueue (timestamp, f i)
 
 {-# INLINE input #-}
 input :: (Eq i, Show i, Show (t i), Traversable t) => VertexReference i -> Timestamp -> t i -> Dataflow ()
