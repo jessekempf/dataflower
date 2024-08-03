@@ -31,6 +31,9 @@ library:
     - time
     - transformers
     - vector
+    - free
+    - text
+    - deepseq
 
 tests:
   spec:

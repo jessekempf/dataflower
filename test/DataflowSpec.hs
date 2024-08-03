@@ -1,6 +1,5 @@
-{-# LANGUAGE LambdaCase          #-}
-{-# LANGUAGE RecursiveDo         #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE LambdaCase #-}
 
 module DataflowSpec (spec) where
 
@@ -24,12 +23,12 @@ spec = do
       results <- runDataflow passthrough numbers
       results `shouldMatchList` numbers
 
-  describe "execute" $ do
+  describe "submit" $ do
     it "isolates the state of runs from each other" $ property $ \(NonEmpty numbers) -> do
       out     <- newTVarIO []
-      program <- compile (inputVertex $ outputSTM (\(results :: [Int])-> modifyTVar' out (results :)))
+      program <- start =<< prepare (inputVertex $ Dataflow.output (\(results :: [Int])-> modifyTVar' out (results :)))
 
-      void $ synchronize =<< execute numbers =<< execute numbers program
+      void $ synchronize =<< submit numbers =<< submit numbers program
 
       [result1, result2] <- readTVarIO out
 
@@ -38,9 +37,9 @@ spec = do
 
     it "bundles all the execution state into a Program" $ property $ \(NonEmpty numbers) -> do
       out     <- newTVarIO 0
-      program <- compile ((inputVertex . integrate) =<< outputSTM (\results -> modifyTVar' out (+ sum results)))
+      program <- start =<< prepare ((inputVertex . integrate) =<< Dataflow.output (\results -> modifyTVar' out (+ sum results)))
 
-      void $ execute numbers program >>= execute numbers >>= execute numbers >>= synchronize
+      void $ submit numbers program >>= submit numbers >>= submit numbers >>= stop
 
       readTVarIO out `shouldReturn` (3 * sum numbers)
 
@@ -56,29 +55,28 @@ spec = do
     it "discards all input" $ property $
       \(numbers :: [Int]) -> runDataflow discard numbers `shouldReturn` ([] :: [()])
 
-passthrough :: (Eq i, Show i) => VertexReference i -> Dataflow (VertexReference i)
-passthrough nextVertex = mdo
-  inputVertex <- vertex () (\ts i _ -> send next ts i) (\_ _ -> return ())
-  next <- connect inputVertex nextVertex
-  return inputVertex
+passthrough :: (Eq i, Show i) => Vertex i -> Graph (Vertex i)
+passthrough nextVertex =
+  using nextVertex $ \next -> 
+    vertex () (\ts i _ -> send next ts i) (\_ _ -> return ())
 
-storeAndForward :: (Eq i, Show i) => VertexReference i -> Dataflow (VertexReference i)
-storeAndForward nextVertex = mdo
-  inputVertex <- vertex Data.Map.Strict.empty (\t i s ->
-    return $ Data.Map.Strict.alter (\case
-                                                    Nothing -> Just [i]
-                                                    Just accum -> Just (i : accum)
-                                                  ) t s
-    ) (\t s -> do
-      mapM_ (send next t) (Data.Map.Strict.findWithDefault [] t s)
-      return $ Data.Map.Strict.delete t s
-    )
-  next <- connect inputVertex nextVertex
-  return inputVertex
+storeAndForward :: (Eq i, Show i) => Vertex i -> Graph (Vertex i)
+storeAndForward nextVertex =
+  using nextVertex $ \next ->
+    vertex Data.Map.Strict.empty (\t i s ->
+      return $ Data.Map.Strict.alter (\case
+                                                      Nothing -> Just [i]
+                                                      Just accum -> Just (i : accum)
+                                                    ) t s
+      ) (\t s -> do
+        mapM_ (send next t) (Data.Map.Strict.findWithDefault [] t s)
+        return $ Data.Map.Strict.delete t s
+      )
 
-integrate :: VertexReference Int -> Dataflow (VertexReference Int)
-integrate nextVertex = mdo
-  inputVertex <- vertex Data.Map.Strict.empty (\timestamp i accumulators ->
+integrate :: Vertex Int -> Graph (Vertex Int)
+integrate nextVertex =
+  using nextVertex $ \next ->
+    vertex Data.Map.Strict.empty (\timestamp i accumulators ->
       return $ Data.Map.Strict.alter (\case
                                         Nothing -> Just i
                                         Just accum -> Just (accum + i)
@@ -87,8 +85,6 @@ integrate nextVertex = mdo
         send next timestamp (accumulators Data.Map.Strict.! timestamp)
         return $ Data.Map.Strict.delete timestamp accumulators
     )
-  next <- connect inputVertex nextVertex
-  return inputVertex
 
-discard :: (Eq i, Show i) => VertexReference () -> Dataflow (VertexReference i)
+discard :: (Eq i, Show i) => Vertex () -> Graph (Vertex i)
 discard _ = vertex () (\_ _ _ -> return ()) (const $ const $ return ())
