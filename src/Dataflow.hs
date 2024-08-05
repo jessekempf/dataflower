@@ -1,14 +1,10 @@
 {-# LANGUAGE DataKinds                 #-}
 {-# LANGUAGE ExistentialQuantification #-}
+{-# LANGUAGE FlexibleInstances         #-}
 {-# LANGUAGE ImpredicativeTypes        #-}
 {-# LANGUAGE KindSignatures            #-}
 {-# LANGUAGE RecordWildCards           #-}
-{-# LANGUAGE TypeApplications #-}
-{-# LANGUAGE DeriveAnyClass #-}
-{-# LANGUAGE StandaloneDeriving #-}
-{-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE NumericUnderscores #-}
-{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE ScopedTypeVariables       #-}
 
 {-|
 Module      : Dataflow
@@ -42,11 +38,14 @@ module Dataflow (
 ) where
 
 import           Control.Concurrent     (forkIO)
-import           Control.Concurrent.STM (TMVar, TQueue, TVar, atomically,
-                                         check, isEmptyTQueue, modifyTVar', newTVarIO, readTQueue,
-                                         readTVar, readTVarIO, retry,
-                                         writeTQueue, writeTVar, putTMVar, takeTMVar, newEmptyTMVarIO)
-import           Control.Monad          (forM, forM_, unless, when, void)
+import           Control.Concurrent.STM (STM, TMVar, TQueue, TVar, atomically,
+                                         check, isEmptyTQueue, modifyTVar',
+                                         newEmptyTMVarIO, newTVarIO, orElse,
+                                         putTMVar, readTQueue, readTVar,
+                                         readTVarIO, retry, takeTMVar,
+                                         writeTQueue, writeTVar)
+import           Control.DeepSeq        (NFData (..))
+import           Control.Monad          (forM, forM_, unless, void, when)
 import           Control.Monad.IO.Class (MonadIO (..))
 import           Control.Monad.State    (runStateT)
 import           Control.Monad.Trans    (MonadTrans (..))
@@ -58,11 +57,6 @@ import           Dataflow.Primitives
 import           GHC.Natural            (Natural)
 import           Prelude                hiding ((<>))
 import           Unsafe.Coerce          (unsafeCoerce)
-import Debug.Trace (traceM, traceShow)
-import Text.Printf (printf)
-import Control.DeepSeq (NFData(..))
-import Data.Time.Clock.System
-import Data.Time.Clock
 
 data RunState =  Run | Stop deriving (Eq, Show)
 
@@ -122,7 +116,7 @@ start Program{..} = liftIO $ do
       VertexDef{..} ->
         forkIO $ do
           -- Runloop code
-          while pvRunState (== Run) $ atomically . runNode dfg $ do
+          while pvRunState (== Run) $ runNode dfg $ do
               (ts, i) <- Node . lift $ readTQueue vertexDefInputQueue
               runStatefully vertexDefStateRef $ vertexDefOnSend ts i
             <> do
@@ -139,10 +133,6 @@ start Program{..} = liftIO $ do
               forM_ vertexDefOutputs $ \(VertexID index) -> do
                 let ProgramVertex { pvTimestampProducers = ovTimestampProducers } = unsafeCoerce (programContent ! index)
                 Node . lift $ modifyTVar' ovTimestampProducers (adjust (\x -> x - 1) timestamp)
-            <> (Node . lift $ do
-              rs <- readTVar pvRunState
-              check (rs /= Run)
-            )
           -- Shutdown code
           atomically $ putTMVar pvExited ()
 
@@ -151,11 +141,11 @@ start Program{..} = liftIO $ do
   return Program{programContent = programContent', ..}
 
   where
-    while :: TVar a -> (a -> Bool) -> IO () -> IO ()
+    while :: TVar a -> (a -> Bool) -> STM () -> IO ()
     while stateVar predicate action = do
       condition <- predicate <$> readTVarIO stateVar
       when condition $ do
-        action
+        atomically $ action `orElse` ((check . (/= condition)) . predicate =<< readTVar stateVar)
         while stateVar predicate action
 
     dfg :: DataflowGraph
@@ -185,8 +175,7 @@ stop Program{..} = do
       writeTVar pvRunState Stop
 
   -- Wait for each and every thread to have stopped
-  forM_ programContent $ \ProgramVertex{..} -> do
-    liftIO . atomically $ takeTMVar pvExited
+  forM_ programContent $ \ProgramVertex{..} -> liftIO . atomically $ takeTMVar pvExited
 
   return Program{..}
 
@@ -205,12 +194,6 @@ submit corpus Program{..} = liftIO $ do
     forM_ programContent $ \ProgramVertex{..} -> do
       timestampProducers <- readTVar pvTimestampProducers
 
-      unless (timestamp `Data.Map.Strict.member` timestampProducers) $ do
-        modifyTVar' pvTimestampProducers (Data.Map.Strict.insert timestamp pvInputCount)
+      unless (timestamp `Data.Map.Strict.member` timestampProducers) $ modifyTVar' pvTimestampProducers (Data.Map.Strict.insert timestamp pvInputCount)
 
   return Program{programNextEpoch = inc programNextEpoch, ..}
-
-
-subtractSystemTime :: SystemTime -> SystemTime -> NominalDiffTime
-subtractSystemTime end start =
-  systemToUTCTime end `diffUTCTime` systemToUTCTime start
