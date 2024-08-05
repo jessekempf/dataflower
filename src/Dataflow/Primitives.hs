@@ -35,7 +35,6 @@ import           Control.Arrow               ((>>>))
 import           Control.Concurrent.STM      (STM, TQueue, newTQueueIO, orElse,
                                               readTVar, writeTQueue, writeTVar)
 import           Control.Concurrent.STM.TVar (TVar, newTVarIO)
-import           Control.Monad.Fix           (MonadFix)
 import           Control.Monad.IO.Class      (liftIO)
 import           Control.Monad.Reader        (MonadReader (ask),
                                               MonadTrans (lift),
@@ -49,8 +48,6 @@ import           Numeric.Natural             (Natural)
 import           Prelude                     hiding (min, (<>))
 import           Unsafe.Coerce               (unsafeCoerce)
 import qualified Data.Map.Strict
-import Debug.Trace (traceM)
-import Text.Printf (printf)
 
 newtype VertexID = VertexID Int deriving (Eq, Ord, Show)
 
