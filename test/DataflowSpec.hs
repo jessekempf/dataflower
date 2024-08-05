@@ -1,15 +1,16 @@
+{-# LANGUAGE LambdaCase          #-}
 {-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE LambdaCase #-}
 
 module DataflowSpec (spec) where
 
+import           Control.Concurrent.STM      (modifyTVar')
 import           Control.Concurrent.STM.TVar (newTVarIO, readTVarIO)
 import           Control.Monad               (void, (>=>))
-import           Dataflow
-import           Prelude
-import           Control.Concurrent.STM      (modifyTVar')
 import qualified Data.Map.Strict
-import           Test.Dataflow               (runDataflow)
+import           Dataflow
+import           Dataflow.Operators          (mcollect)
+import           Prelude
+import           Test.Dataflow               (runDataflow, runDataflowMany)
 import           Test.Hspec
 import           Test.QuickCheck             hiding (discard)
 
@@ -42,6 +43,11 @@ spec = do
       void $ submit numbers program >>= submit numbers >>= submit numbers >>= stop
 
       readTVarIO out `shouldReturn` (3 * sum numbers)
+
+  describe "runDataflowMany" $ do
+    it "leads to the production of only as many outputs as inputs" $ property $ \(NonEmpty (numbers :: [Sum Int])) -> do
+      runDataflowMany mcollect (replicate 1 numbers) `shouldReturn` [[sum numbers]]
+      runDataflowMany mcollect (replicate 2 numbers) `shouldReturn` [[sum numbers], [sum numbers]]
 
   describe "finalize" $ do
     it "finalizes vertices" $ property $

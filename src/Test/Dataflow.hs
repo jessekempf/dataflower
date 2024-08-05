@@ -9,9 +9,10 @@ import           Control.Concurrent.STM.TVar (modifyTVar', newTVarIO,
 import           Control.Monad               (foldM, void)
 import           Control.Monad.IO.Class      (MonadIO (..))
 import           Control.Monad.Trans         (MonadTrans (..))
-import           Dataflow                    (Vertex, prepare, start, stop,
-                                              submit, synchronize, Graph, inputVertex)
-import           Dataflow.Primitives         (Input, Node (Node), vertex)
+import           Dataflow                    (Graph, Vertex, inputVertex,
+                                              prepare, start, stop, submit)
+import           Dataflow.Operators          (statefulVertex)
+import           Dataflow.Primitives         (Node (Node))
 import           Prelude
 
 -- | Run a dataflow with a list of inputs. All inputs will be sent as part of
@@ -32,12 +33,12 @@ runDataflowMany dataflow inputs =
     runnableProgram <- prepare (inputVertex . dataflow =<< outputTVarNestedList out)
     program <- start runnableProgram
 
-    stop =<< foldM (flip submit) program inputs
+    void $ stop =<< foldM (flip submit) program inputs
 
-    readTVarIO out
+    reverse <$> readTVarIO out
   where
     outputTVarNestedList register =
-        vertex []
+        statefulVertex []
         (\_ x state -> return (x : state))
-        ( \_ state -> Node . lift $ modifyTVar' register (state :) >> return [])
+        ( \_ state -> Node . lift $ modifyTVar' register (state :))
 

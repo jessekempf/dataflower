@@ -19,6 +19,8 @@ module Dataflow.Operators (
   fanout,
   fold,
   mcollect,
+  statelessVertex,
+  statefulVertex,
 ) where
 
 import           Control.Monad       (forM_)
