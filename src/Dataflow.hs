@@ -3,6 +3,7 @@
 {-# LANGUAGE FlexibleInstances         #-}
 {-# LANGUAGE ImpredicativeTypes        #-}
 {-# LANGUAGE KindSignatures            #-}
+{-# LANGUAGE LambdaCase                #-}
 {-# LANGUAGE RecordWildCards           #-}
 {-# LANGUAGE ScopedTypeVariables       #-}
 
@@ -39,11 +40,12 @@ module Dataflow (
 
 import           Control.Concurrent     (forkIO)
 import           Control.Concurrent.STM (STM, TMVar, TQueue, TVar, atomically,
-                                         check, isEmptyTQueue, modifyTVar',
-                                         newEmptyTMVarIO, newTVarIO, orElse,
-                                         putTMVar, readTQueue, readTVar,
-                                         readTVarIO, retry, takeTMVar,
-                                         writeTQueue, writeTVar)
+                                         check, flushTQueue, isEmptyTQueue,
+                                         modifyTVar', newEmptyTMVarIO,
+                                         newTVarIO, orElse, putTMVar,
+                                         readTQueue, readTVar, readTVarIO,
+                                         retry, takeTMVar, writeTQueue,
+                                         writeTVar)
 import           Control.DeepSeq        (NFData (..))
 import           Control.Monad          (forM, forM_, unless, void, when)
 import           Control.Monad.IO.Class (MonadIO (..))
@@ -117,8 +119,13 @@ start Program{..} = liftIO $ do
         forkIO $ do
           -- Runloop code
           while pvRunState (== Run) $ runNode dfg $ do
-              (ts, i) <- Node . lift $ readTQueue vertexDefInputQueue
-              runStatefully vertexDefStateRef $ vertexDefOnSend ts i
+              inputs <- Node . lift $ do
+                flushTQueue vertexDefInputQueue >>= \case
+                  [] -> retry
+                  q -> return q
+
+              forM_ inputs $ \(ts, i) ->
+                runStatefully vertexDefStateRef $ vertexDefOnSend ts i
             <> do
               timestamp <- Node . lift $ do
                 producersTable <- readTVar pvTimestampProducers
@@ -187,10 +194,10 @@ submit :: (MonadIO io, Traversable t, Show (t i), Show i, Eq i) => t i -> Progra
 submit corpus Program{..} = liftIO $ do
   let timestamp = Timestamp programNextEpoch
 
-  atomically $ do
-    forM_ corpus $ \item ->
-      writeTQueue programInput (timestamp, item)
+  forM_ corpus $ \item -> atomically $ do
+    writeTQueue programInput (timestamp, item)
 
+  atomically $ do
     forM_ programContent $ \ProgramVertex{..} -> do
       timestampProducers <- readTVar pvTimestampProducers
 
