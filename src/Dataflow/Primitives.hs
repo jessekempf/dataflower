@@ -65,7 +65,7 @@ instance Hashable Timestamp where
 -- takes 'a's as its input.
 --
 -- @since 0.1.0.0
-data Edge a = Direct {-# UNPACK #-} (TQueue (Timestamp, a)) | forall b. Mapped {-# UNPACK #-} (a -> b) {-# UNPACK #-} (TQueue (Timestamp, b))
+data Edge a = Direct {-# UNPACK #-} (TQueue (Timestamp, a)) | forall b. Mapped (a -> b) {-# UNPACK #-} (TQueue (Timestamp, b))
 
 newtype Vertex a = Vertex VertexID deriving Show
 

@@ -2,7 +2,6 @@
 
 module Main where
 
-import           Control.Monad      (void)
 import           Data.Monoid        (Sum (..))
 import           Dataflow.Operators (mcollect)
 import           Prelude

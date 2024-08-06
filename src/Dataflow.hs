@@ -42,10 +42,9 @@ import           Control.Concurrent     (forkIO)
 import           Control.Concurrent.STM (STM, TMVar, TQueue, TVar, atomically,
                                          check, flushTQueue, isEmptyTQueue,
                                          modifyTVar', newEmptyTMVarIO,
-                                         newTVarIO, orElse, putTMVar,
-                                         readTQueue, readTVar, readTVarIO,
-                                         retry, takeTMVar, writeTQueue,
-                                         writeTVar)
+                                         newTVarIO, orElse, putTMVar, readTVar,
+                                         readTVarIO, retry, takeTMVar,
+                                         writeTQueue, writeTVar)
 import           Control.DeepSeq        (NFData (..))
 import           Control.Monad          (forM, forM_, unless, void, when)
 import           Control.Monad.IO.Class (MonadIO (..))
