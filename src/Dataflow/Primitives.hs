@@ -2,57 +2,78 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE MultiParamTypeClasses      #-}
 {-# LANGUAGE RecordWildCards            #-}
+{-# LANGUAGE ScopedTypeVariables        #-}
+{-# LANGUAGE ImpredicativeTypes #-}
+{-# LANGUAGE LambdaCase #-}
 
-module Dataflow.Primitives (
-  Dataflow(..),
-  DataflowState,
-  Vertex(..),
-  initDataflowState,
-  duplicateDataflowState,
-  StateRef,
-  newState,
-  readState,
-  writeState,
-  modifyState,
-  Edge,
-  Timestamp(..),
-  registerVertex,
-  registerFinalizer,
-  incrementEpoch,
-  input,
-  send,
-  finalize
-) where
+module Dataflow.Primitives
+  ( Graph (..),
+    Node(..),
+    DataflowGraph(..),
+    Vertex,
+    VertexID(..),
+    VertexDef(..),
+    initDataflowState,
+    Edge,
+    Input(..),
+    Epoch (..),
+    Timestamp (..),
+    inc,
+    send,
+    vertex,
+    using,
+    output,
+    inputVertex,
+    runNode,
+    runStatefully,
+    (<>),
+    -- quiesce
+  )
+where
 
-import           Control.Arrow              ((>>>))
-import           Control.Monad              (forM, (>=>))
-import           Control.Monad.IO.Class     (liftIO)
-import           Control.Monad.State.Strict (StateT, get, gets, modify)
-import           Control.Monad.Trans        (lift)
-import           Data.Hashable              (Hashable (..))
-import           Data.IORef                 (IORef, modifyIORef', newIORef,
-                                             readIORef, writeIORef)
-import           Data.Vector                (Vector, empty, snoc, unsafeIndex)
-import           GHC.Exts                   (Any)
-import           Numeric.Natural            (Natural)
-import           Prelude
-import           Unsafe.Coerce              (unsafeCoerce)
+import           Control.Arrow               ((>>>))
+import           Control.Concurrent.STM      (STM, TQueue, newTQueueIO, orElse,
+                                              readTVar, writeTQueue, writeTVar)
+import           Control.Concurrent.STM.TVar (TVar, newTVarIO)
+import           Control.Monad.IO.Class      (liftIO)
+import           Control.Monad.Reader        (MonadReader (ask),
+                                              MonadTrans (lift),
+                                              ReaderT (runReaderT))
+import           Control.Monad.State         (StateT, gets, modify)
+import           Data.Functor.Contravariant  (Contravariant (contramap))
+import           Data.Hashable               (Hashable (..))
+import           Data.Vector                 (Vector, empty, snoc, (!), (//))
+import           GHC.Exts                    (Any)
+import           Numeric.Natural             (Natural)
+import           Prelude                     hiding (min, (<>))
+import           Unsafe.Coerce               (unsafeCoerce)
+import qualified Data.Map.Strict
 
+newtype VertexID = VertexID Int deriving (Eq, Ord, Show)
 
-newtype VertexID    = VertexID        Int deriving (Eq, Ord, Show)
-newtype StateID     = StateID         Int deriving (Eq, Ord, Show)
-newtype Epoch       = Epoch       Natural deriving (Eq, Ord, Hashable, Show)
+newtype Epoch = Epoch Natural deriving (Eq, Ord, Hashable, Show)
 
 -- | 'Timestamp's represent instants in the causal timeline.
 --
 -- @since 0.1.0.0
-newtype Timestamp   = Timestamp     Epoch deriving (Eq, Ord, Hashable, Show)
+newtype Timestamp = Timestamp Epoch deriving (Eq, Ord, Show)
+
+instance Hashable Timestamp where
+  hashWithSalt salt (Timestamp epoch) = hashWithSalt salt epoch
 
 -- | An 'Edge' is a typed reference to a computational vertex that
 -- takes 'a's as its input.
 --
 -- @since 0.1.0.0
-newtype Edge a      = Edge       VertexID
+data Edge a = Direct {-# UNPACK #-} (TQueue (Timestamp, a)) | forall b. Mapped (a -> b) {-# UNPACK #-} (TQueue (Timestamp, b))
+
+newtype Vertex a = Vertex VertexID deriving Show
+
+newtype Input a = Input (TQueue (Timestamp, a))
+instance Contravariant Edge where
+  contramap f (Direct inputQueue)   = Mapped f inputQueue
+  contramap f (Mapped g inputQueue) = Mapped (g . f) inputQueue
+
 
 -- | Class of entities that can be incremented by one.
 class Incrementable a where
@@ -61,175 +82,106 @@ class Incrementable a where
 instance Incrementable VertexID where
   inc (VertexID n) = VertexID (n + 1)
 
-instance Incrementable StateID where
-  inc (StateID n) = StateID (n + 1)
-
 instance Incrementable Epoch where
   inc (Epoch n) = Epoch (n + 1)
 
+newtype DataflowGraph = DataflowGraph { dfsVertices     :: Vector (VertexDef Any) }
 
-data DataflowState = DataflowState {
-  dfsVertices       :: Vector Any,
-  dfsStates         :: Vector (IORef Any),
-  dfsFinalizers     :: [Timestamp -> Dataflow ()],
-  dfsLastVertexID   :: VertexID,
-  dfsLastStateID    :: StateID,
-  dfsLastInputEpoch :: Epoch
-}
+initDataflowState :: DataflowGraph
+initDataflowState = DataflowGraph{ dfsVertices = empty }
 
 -- | `Dataflow` is the type of all dataflow operations.
 --
 -- @since 0.1.0.0
-newtype Dataflow a = Dataflow { runDataflow :: StateT DataflowState IO a }
+newtype Graph a = Graph {runDataflow :: StateT DataflowGraph IO a}
   deriving (Functor, Applicative, Monad)
 
-initDataflowState :: DataflowState
-initDataflowState = DataflowState {
-  dfsVertices       = empty,
-  dfsStates         = empty,
-  dfsFinalizers     = [],
-  dfsLastVertexID   = VertexID (-1),
-  dfsLastStateID    = StateID (-1),
-  dfsLastInputEpoch = Epoch 0
+getVertexDef :: Vertex i -> Graph (VertexDef i)
+getVertexDef (Vertex (VertexID index)) = Graph $ gets (dfsVertices >>> (! index) >>> unsafeCoerce)
+
+updateVertexDef :: Vertex i -> (VertexDef i -> VertexDef i) -> Graph ()
+updateVertexDef (Vertex (VertexID index)) mutator = Graph $ do
+  modify (\DataflowGraph{..} ->
+      DataflowGraph {
+        dfsVertices = dfsVertices // [(index, unsafeCoerce (mutator (unsafeCoerce (dfsVertices ! index))))],
+        ..
+      }
+    )
+newtype Node a = Node (ReaderT DataflowGraph STM a)
+  deriving (Functor, Applicative, Monad)
+
+
+runNode :: DataflowGraph -> Node a -> STM a
+runNode graph (Node actions) = runReaderT actions graph
+
+{-# INLINE runStatefully #-}
+runStatefully :: TVar s -> (s -> Node s) -> Node ()
+runStatefully stateRef action = Node (lift $ readTVar stateRef) >>= action >>= Node . lift . writeTVar stateRef
+
+{-# INLINE (<>) #-}
+(<>) :: Node a -> Node a -> Node a
+(Node first) <> (Node second) = Node $ do
+  stateRef <- ask
+
+  lift (runReaderT first stateRef `orElse` runReaderT second stateRef)
+data VertexDef input = forall state. VertexDef {
+  vertexDefId         :: VertexID,
+  vertexDefStateRef   :: TVar state,
+  vertexDefInputQueue :: TQueue (Timestamp, input),
+  vertexDefInputs     :: [VertexID],
+  vertexDefOutputs    :: [VertexID],
+  vertexDefOnSend     :: Timestamp -> input -> state -> Node state,
+  vertexDefOnNotify   :: Timestamp -> state -> Node state
 }
 
-duplicateDataflowState :: Dataflow DataflowState
-duplicateDataflowState = Dataflow $ do
-  DataflowState{..} <- get
+vertex :: state -> (Timestamp -> input -> state -> Node state) -> (Timestamp -> state -> Node state) -> Graph (Vertex input)
+vertex initialState vertexDefOnSend vertexDefOnNotify = Graph $ do
+  vertexId <- gets (dfsVertices >>> length >>> VertexID)
 
-  newStates <- liftIO $ forM dfsStates dupIORef
+  vertexDefStateRef <- liftIO $ newTVarIO initialState
+  vertexDefInputQueue <- liftIO newTQueueIO
 
-  return $ DataflowState { dfsStates = newStates, .. }
+  let vertexDef = VertexDef {
+    vertexDefId = vertexId,
+    vertexDefInputs = [],
+    vertexDefOutputs = [],
+    ..
+  }
 
-  where
-    dupIORef = readIORef >=> newIORef
+  modify (\DataflowGraph{..} -> DataflowGraph{ dfsVertices = dfsVertices `snoc` unsafeCoerce vertexDef })
 
--- | Get the next input Epoch.
-incrementEpoch :: Dataflow Epoch
-incrementEpoch =
-  Dataflow $ do
-    epoch <- gets (dfsLastInputEpoch >>> inc)
+  return (Vertex vertexId)
 
-    modify $ \s -> s { dfsLastInputEpoch = epoch }
+using :: forall output input. Vertex output -> (Edge output -> Graph (Vertex input)) -> Graph (Vertex input)
+using outputVertex@(Vertex outputVertexID) continuation = do
+  outputVertexDef <- getVertexDef outputVertex
 
-    return epoch
+  thisVertex@(Vertex thisVertexID) <- continuation $ Direct (vertexDefInputQueue outputVertexDef)
 
+  updateVertexDef outputVertex (\VertexDef{..} -> VertexDef{vertexDefInputs = thisVertexID : vertexDefInputs, ..})
+  updateVertexDef thisVertex (\VertexDef{..} -> VertexDef{vertexDefOutputs = outputVertexID : vertexDefOutputs, .. })
+  return thisVertex
 
-data Vertex i = forall s.
-    StatefulVertex
-      (StateRef s)
-      (StateRef s -> Timestamp -> i -> Dataflow ())
-  | StatelessVertex
-      (Timestamp -> i -> Dataflow ())
-
--- | Retrieve the vertex for a given edge.
-lookupVertex :: Edge i -> Dataflow (Vertex i)
-lookupVertex (Edge (VertexID vindex)) =
-  Dataflow $ do
-    vertices <- gets dfsVertices
-
-    return $ unsafeCoerce (vertices `unsafeIndex` vindex)
-
--- | Store a provided vertex and obtain an 'Edge' that refers to it.
-registerVertex :: Vertex i -> Dataflow (Edge i)
-registerVertex vertex =
-  Dataflow $ do
-    vid <- gets (dfsLastVertexID >>> inc)
-
-    modify $ addVertex vertex vid
-
-    return (Edge vid)
-
-  where
-    addVertex vtx vid s = s {
-      dfsVertices     = dfsVertices s `snoc` unsafeCoerce vtx,
-      dfsLastVertexID = vid
-    }
-
--- | Store a provided finalizer.
-registerFinalizer :: (Timestamp -> Dataflow ()) -> Dataflow ()
-registerFinalizer finalizer =
-  Dataflow $ modify $ \s -> s { dfsFinalizers = finalizer : dfsFinalizers s }
-
--- | Mutable state that holds an `a`.
---
--- @since 0.1.0.0
-newtype StateRef a = StateRef StateID
-
--- | Create a `StateRef` initialized to the provided `a`.
---
--- @since 0.1.0.0
-newState :: a -> Dataflow (StateRef a)
-newState a =
-  Dataflow $ do
-    sid   <- gets (dfsLastStateID >>> inc)
-    ioref <- lift $ newIORef (unsafeCoerce a)
-
-    modify $ addState ioref sid
-
-    return (StateRef sid)
-
-  where
-    addState ref sid s = s {
-      dfsStates      = dfsStates s `snoc` ref,
-      dfsLastStateID = sid
-    }
-
-lookupStateRef :: StateRef s -> Dataflow (IORef Any)
-lookupStateRef (StateRef (StateID sindex)) =
-  Dataflow $ do
-    states <- gets dfsStates
-
-    return (states `unsafeIndex` sindex)
-
--- | Read the value stored in the `StateRef`.
---
--- @since 0.1.0.0
-readState :: StateRef a -> Dataflow a
-readState sref = do
-  ioref <- lookupStateRef sref
-  Dataflow $ lift (unsafeCoerce <$> readIORef ioref)
-
--- | Overwrite the value stored in the `StateRef`.
---
--- @since 0.1.0.0
-writeState :: StateRef a -> a -> Dataflow ()
-writeState sref x = do
-  ioref <- lookupStateRef sref
-  Dataflow $ lift $ writeIORef ioref (unsafeCoerce x)
-
--- | Update the value stored in `StateRef`.
---
--- @since 0.1.0.0
-modifyState :: StateRef a -> (a -> a) -> Dataflow ()
-modifyState sref op = do
-  ioref <- lookupStateRef sref
-  Dataflow $ lift $ modifyIORef' ioref (unsafeCoerce . op . unsafeCoerce)
-
-{-# INLINEABLE input #-}
-input :: Traversable t => t i -> Edge i -> Dataflow ()
-input inputs next = do
-  timestamp <- Timestamp <$> incrementEpoch
-
-  mapM_ (send next timestamp) inputs
-
-  finalize timestamp
+inputVertex :: Graph (Vertex i) -> Graph (Input i)
+inputVertex vref = do
+  vtx <- getVertexDef =<< vref
+  return (Input $ vertexDefInputQueue vtx)
 
 {-# INLINE send #-}
--- | Send an `input` item to be worked on to the indicated vertex.
---
--- @since 0.1.0.0
-send :: Edge input -> Timestamp -> input -> Dataflow ()
-send e t i = lookupVertex e >>= invoke t i
-  where
-    invoke timestamp datum (StatefulVertex sref callback) = callback sref timestamp datum
-    invoke timestamp datum (StatelessVertex callback)     = callback timestamp datum
+send :: Show i => Edge i -> Timestamp -> i -> Node ()
+send (Direct inputQueue) timestamp i = Node . lift $ writeTQueue inputQueue (timestamp, i)
+send (Mapped f inputQueue) timestamp i = Node . lift $ writeTQueue inputQueue (timestamp, f i)
 
--- Notify all relevant vertices that no more input is coming for `Timestamp`.
---
--- @since 0.1.0.0
-finalize :: Timestamp -> Dataflow ()
-finalize t = do
-  finalizers <- Dataflow $ gets dfsFinalizers
-
-  mapM_ (\p -> p t) finalizers
+output :: (Eq o, Show o) => ([o] -> STM ()) -> Graph (Vertex o)
+output stmAction =
+  vertex
+    (Data.Map.Strict.empty :: Data.Map.Strict.Map Timestamp [o])
+    (\timestamp o state ->
+      return $ Data.Map.Strict.alter (\case
+                                        Nothing -> Just [o]
+                                        Just accum -> Just (o : accum)
+                                      ) timestamp state
+    ) (\timestamp state -> do
+        Node . lift $ stmAction $ state Data.Map.Strict.! timestamp
+        return $ Data.Map.Strict.delete timestamp state
+    )

@@ -1,42 +1,54 @@
+{-# LANGUAGE LambdaCase          #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
 module DataflowSpec (spec) where
 
+import           Control.Concurrent.STM      (modifyTVar')
 import           Control.Concurrent.STM.TVar (newTVarIO, readTVarIO)
 import           Control.Monad               (void, (>=>))
+import qualified Data.Map.Strict
+import           Data.Monoid                 (Sum)
 import           Dataflow
+import           Dataflow.Operators          (mcollect)
 import           Prelude
-
-import           Test.Dataflow               (runDataflow)
+import           Test.Dataflow               (runDataflow, runDataflowMany)
 import           Test.Hspec
 import           Test.QuickCheck             hiding (discard)
-import           Test.QuickCheck.Modifiers   (NonEmptyList (..))
-
 
 spec :: Spec
 spec = do
+  it "can pass through data at all" $ do
+    runDataflow passthrough ["hello world"] `shouldReturn` ["hello world"]
+
   it "can pass through data without modification" $ property $ do
-    let passthrough next = statelessVertex $ \t x -> send next t x
+    \(numbers :: [Integer]) -> do
+      results <- runDataflow passthrough numbers
+      results `shouldMatchList` numbers
 
-    \(numbers :: [Integer]) -> runDataflow passthrough numbers `shouldReturn` numbers
-
-  describe "execute" $ do
+  describe "submit" $ do
     it "isolates the state of runs from each other" $ property $ \(NonEmpty numbers) -> do
       out     <- newTVarIO []
-      program <- compile (integrate =<< outputTVar (:) out)
+      program <- start =<< prepare (inputVertex $ Dataflow.output (\(results :: [Int])-> modifyTVar' out (results :)))
 
-      void $ execute numbers program
-      void $ execute numbers program
+      void $ synchronize =<< submit numbers =<< submit numbers program
 
-      (reverse <$> readTVarIO out) `shouldReturn` (scanl1 (+) numbers ++ scanl1 (+) numbers)
+      [result1, result2] <- readTVarIO out
+
+      result1 `shouldMatchList` numbers
+      result2 `shouldMatchList` numbers
 
     it "bundles all the execution state into a Program" $ property $ \(NonEmpty numbers) -> do
       out     <- newTVarIO 0
-      program <- compile (integrate =<< outputTVar const out)
+      program <- start =<< prepare ((inputVertex . integrate) =<< Dataflow.output (\results -> modifyTVar' out (+ sum results)))
 
-      void $ execute numbers program >>= execute numbers >>= execute numbers
+      void $ submit numbers program >>= submit numbers >>= submit numbers >>= stop
 
       readTVarIO out `shouldReturn` (3 * sum numbers)
+
+  describe "runDataflowMany" $ do
+    it "leads to the production of only as many outputs as inputs" $ property $ \(NonEmpty (numbers :: [Sum Int])) -> do
+      runDataflowMany mcollect (replicate 1 numbers) `shouldReturn` [[sum numbers]]
+      runDataflowMany mcollect (replicate 2 numbers) `shouldReturn` [[sum numbers], [sum numbers]]
 
   describe "finalize" $ do
     it "finalizes vertices" $ property $
@@ -48,22 +60,38 @@ spec = do
 
   describe "discard" $
     it "discards all input" $ property $
-      \(numbers :: [Int]) -> runDataflow (const discard) numbers `shouldReturn` ([] :: [Int])
+      \(numbers :: [Int]) -> runDataflow discard numbers `shouldReturn` ([] :: [()])
 
-storeAndForward :: Edge i -> Dataflow (Edge i)
-storeAndForward next = statefulVertex [] store forward
-  where
-    store sref _ i = modifyState sref (i :)
-    forward sref t = do
-      mapM_ (send next t) . reverse =<< readState sref
-      writeState sref []
+passthrough :: (Eq i, Show i) => Vertex i -> Graph (Vertex i)
+passthrough nextVertex =
+  using nextVertex $ \next -> 
+    vertex () (\ts i _ -> send next ts i) (\_ _ -> return ())
 
-integrate :: Edge Int -> Dataflow (Edge Int)
-integrate next = statefulVertex 0 recv finalize
-  where
-    recv s t i   = do
-      modifyState s (+ i)
+storeAndForward :: (Eq i, Show i) => Vertex i -> Graph (Vertex i)
+storeAndForward nextVertex =
+  using nextVertex $ \next ->
+    vertex Data.Map.Strict.empty (\t i s ->
+      return $ Data.Map.Strict.alter (\case
+                                                      Nothing -> Just [i]
+                                                      Just accum -> Just (i : accum)
+                                                    ) t s
+      ) (\t s -> do
+        mapM_ (send next t) (Data.Map.Strict.findWithDefault [] t s)
+        return $ Data.Map.Strict.delete t s
+      )
 
-      send next t =<< readState s
+integrate :: Vertex Int -> Graph (Vertex Int)
+integrate nextVertex =
+  using nextVertex $ \next ->
+    vertex Data.Map.Strict.empty (\timestamp i accumulators ->
+      return $ Data.Map.Strict.alter (\case
+                                        Nothing -> Just i
+                                        Just accum -> Just (accum + i)
+                                      ) timestamp accumulators
+    ) (\timestamp accumulators -> do
+        send next timestamp (accumulators Data.Map.Strict.! timestamp)
+        return $ Data.Map.Strict.delete timestamp accumulators
+    )
 
-    finalize _ _ = return ()
+discard :: (Eq i, Show i) => Vertex () -> Graph (Vertex i)
+discard _ = vertex () (\_ _ _ -> return ()) (const $ const $ return ())
