@@ -7,6 +7,7 @@ import           Control.Concurrent.STM      (modifyTVar')
 import           Control.Concurrent.STM.TVar (newTVarIO, readTVarIO)
 import           Control.Monad               (void, (>=>))
 import qualified Data.Map.Strict
+import           Data.Monoid                 (Sum)
 import           Dataflow
 import           Dataflow.Operators          (mcollect)
 import           Prelude
