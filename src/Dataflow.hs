@@ -25,6 +25,7 @@ module Dataflow (
   Timestamp,
   send,
   vertex,
+  Input,
   inputVertex,
   Vertex,
   using,
