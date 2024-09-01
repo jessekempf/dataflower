@@ -168,11 +168,11 @@ inputVertex vref = do
   return (Input $ vertexDefInputQueue vtx)
 
 {-# INLINE send #-}
-send :: Show i => Edge i -> Timestamp -> i -> Node ()
+send :: Edge i -> Timestamp -> i -> Node ()
 send (Direct inputQueue) timestamp i = Node . lift $ writeTQueue inputQueue (timestamp, i)
 send (Mapped f inputQueue) timestamp i = Node . lift $ writeTQueue inputQueue (timestamp, f i)
 
-output :: (Eq o, Show o) => ([o] -> STM ()) -> Graph (Vertex o)
+output :: ([o] -> STM ()) -> Graph (Vertex o)
 output stmAction =
   vertex
     (Data.Map.Strict.empty :: Data.Map.Strict.Map Timestamp [o])
