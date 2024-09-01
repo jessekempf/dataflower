@@ -1,5 +1,5 @@
 name: dataflower
-version: 0.3.0.0
+version: 0.5.0.0
 synopsis: A Pure-Haskell Timely Dataflow System
 description: See README
 maintainer: Jesse Kempf
@@ -22,13 +22,18 @@ library:
     - Dataflow.Operators
     - Test.Dataflow
   dependencies:
+    - containers
     - hashable
     - mtl
+    - pqueue
     - pretty-show
     - stm
     - time
     - transformers
     - vector
+    - free
+    - text
+    - deepseq
 
 tests:
   spec:
@@ -36,6 +41,7 @@ tests:
     source-dirs:
       - test
     dependencies:
+      - containers
       - dataflower
       - hspec >=2.0.0
       - QuickCheck
@@ -45,8 +51,18 @@ benchmarks:
   performance:
     main: Main.hs
     source-dirs: benchmark
+    ghc-options:
+      - -O2
     dependencies:
       - dataflower
       - criterion
       - stm
-    ghc-options: -O2
+
+executables:
+  noop:
+    main: Noop.hs
+    source-dirs: examples
+    ghc-options:
+      - -rtsopts -O2
+    dependencies:
+      - dataflower

@@ -1,3 +1,7 @@
+
+{-# LANGUAGE ImpredicativeTypes  #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+
 {-|
 Module      : Dataflow
 Description : Timely Dataflow for Haskell
@@ -13,135 +17,48 @@ Common utility operators for data flows
 
 module Dataflow.Operators (
   fanout,
-  map,
-  join2,
-  join3,
-  join4,
-  join5,
-  join6
+  fold,
+  mcollect,
+  statelessVertex,
+  statefulVertex,
 ) where
 
-import           Dataflow.Primitives (Dataflow, Edge, StateRef, Timestamp,
-                                      Vertex (StatefulVertex), newState,
-                                      registerFinalizer, registerVertex, send)
-import           Dataflow.Vertices   (statelessVertex)
-import           Prelude             (mapM_, ($), (<$>), (<*>))
-
+import           Control.Monad       (forM_)
+import           Data.Map.Strict     (Map, delete, empty, findWithDefault,
+                                      insert)
+import           Dataflow.Primitives (Edge, Graph, Node, Timestamp, Vertex,
+                                      send, using, vertex)
 
 -- | Construct a stateless vertex that sends each input to every 'Edge' in the output list.
 --
 -- @since 0.1.3.0
-fanout :: [Edge a] -> Dataflow (Edge a)
-fanout nexts = statelessVertex $ \timestamp x -> mapM_ (\next -> send next timestamp x) nexts
+fanout :: forall a. (Eq a, Show a) => [Vertex a] -> Graph (Vertex a)
+fanout nextVertices = go nextVertices []
+  where
+    go :: [Vertex a] -> [Edge a] -> Graph (Vertex a)
+    go [] edges = statelessVertex (\timestamp a -> forM_ edges (\edge -> send edge timestamp a))
+    go (vtx : vtxs) edges = using vtx (\edge -> go vtxs (edge : edges))
 
--- | Construct a stateless vertex that applies the provided function to every input
--- and sends the result to the output.
---
--- @since 0.1.3.0
-map :: (i -> o) -> Edge o -> Dataflow (Edge i)
-map f next = statelessVertex $ \timestamp x -> send next timestamp (f x)
+fold :: (Eq i, Show i, Eq o, Show o, Show state) => state -> (i -> state -> state) -> (state -> o) -> Vertex o -> Graph (Vertex i)
+fold zeroState accumulate output nextVertex =
+  using nextVertex $ \next ->
+    statefulVertex zeroState
+      (\_ i state -> return (accumulate i state))
+      (\timestamp state -> send next timestamp (output state))
 
--- | Construct a stateful vertex with two input edges.
---
--- @since 0.1.3.0
-join2 ::
-  state
-  -> (StateRef state -> Timestamp -> i -> Dataflow ())
-  -> (StateRef state -> Timestamp -> j -> Dataflow ())
-  -> (StateRef state -> Timestamp -> Dataflow ())
-  -> Dataflow (Edge i, Edge j)
-join2 initState callbackI callbackJ finalizer = do
-  stateRef <- newState initState
+mcollect :: (Eq a, Show a, Monoid a) => Vertex a -> Graph (Vertex a)
+mcollect = fold mempty mappend id
 
-  registerFinalizer $ finalizer stateRef
+statelessVertex :: (Eq i, Show i) => (Timestamp -> i -> Node()) -> Graph (Vertex i)
+statelessVertex onRecv = vertex () (\t i _ -> onRecv t i) (\_ _ -> return ())
 
-  (,) <$> registerVertex (StatefulVertex stateRef callbackI)
-      <*> registerVertex (StatefulVertex stateRef callbackJ)
-
--- | Construct a stateful vertex with three input edges.
---
--- @since 0.1.3.0
-join3 ::
-  state
-  -> (StateRef state -> Timestamp -> i -> Dataflow ())
-  -> (StateRef state -> Timestamp -> j -> Dataflow ())
-  -> (StateRef state -> Timestamp -> k -> Dataflow ())
-  -> (StateRef state -> Timestamp -> Dataflow ())
-  -> Dataflow (Edge i, Edge j, Edge k)
-join3 initState callbackI callbackJ callbackK finalizer = do
-  stateRef <- newState initState
-
-  registerFinalizer $ finalizer stateRef
-
-  (,,) <$> registerVertex (StatefulVertex stateRef callbackI)
-       <*> registerVertex (StatefulVertex stateRef callbackJ)
-       <*> registerVertex (StatefulVertex stateRef callbackK)
-
--- | Construct a stateful vertex with four input edges.
---
--- @since 0.2.1.0
-join4 ::
-  state
-  -> (StateRef state -> Timestamp -> i1 -> Dataflow ())
-  -> (StateRef state -> Timestamp -> i2 -> Dataflow ())
-  -> (StateRef state -> Timestamp -> i3 -> Dataflow ())
-  -> (StateRef state -> Timestamp -> i4 -> Dataflow ())
-  -> (StateRef state -> Timestamp -> Dataflow ())
-  -> Dataflow (Edge i1, Edge i2, Edge i3, Edge i4)
-join4 initState callback1 callback2 callback3 callback4 finalizer = do
-  stateRef <- newState initState
-
-  registerFinalizer $ finalizer stateRef
-
-  (,,,) <$> registerVertex (StatefulVertex stateRef callback1)
-        <*> registerVertex (StatefulVertex stateRef callback2)
-        <*> registerVertex (StatefulVertex stateRef callback3)
-        <*> registerVertex (StatefulVertex stateRef callback4)
-
--- | Construct a stateful vertex with five input edges.
---
--- @since 0.2.1.0
-join5 ::
-  state
-  -> (StateRef state -> Timestamp -> i1 -> Dataflow ())
-  -> (StateRef state -> Timestamp -> i2 -> Dataflow ())
-  -> (StateRef state -> Timestamp -> i3 -> Dataflow ())
-  -> (StateRef state -> Timestamp -> i4 -> Dataflow ())
-  -> (StateRef state -> Timestamp -> i5 -> Dataflow ())
-  -> (StateRef state -> Timestamp -> Dataflow ())
-  -> Dataflow (Edge i1, Edge i2, Edge i3, Edge i4, Edge i5)
-join5 initState callback1 callback2 callback3 callback4 callback5 finalizer = do
-  stateRef <- newState initState
-
-  registerFinalizer $ finalizer stateRef
-
-  (,,,,) <$> registerVertex (StatefulVertex stateRef callback1)
-         <*> registerVertex (StatefulVertex stateRef callback2)
-         <*> registerVertex (StatefulVertex stateRef callback3)
-         <*> registerVertex (StatefulVertex stateRef callback4)
-         <*> registerVertex (StatefulVertex stateRef callback5)
-
--- | Construct a stateful vertex with six input edges.
---
--- @since 0.2.1.0
-join6 ::
-  state
-  -> (StateRef state -> Timestamp -> i1 -> Dataflow ())
-  -> (StateRef state -> Timestamp -> i2 -> Dataflow ())
-  -> (StateRef state -> Timestamp -> i3 -> Dataflow ())
-  -> (StateRef state -> Timestamp -> i4 -> Dataflow ())
-  -> (StateRef state -> Timestamp -> i5 -> Dataflow ())
-  -> (StateRef state -> Timestamp -> i6 -> Dataflow ())
-  -> (StateRef state -> Timestamp -> Dataflow ())
-  -> Dataflow (Edge i1, Edge i2, Edge i3, Edge i4, Edge i5, Edge i6)
-join6 initState callback1 callback2 callback3 callback4 callback5 callback6 finalizer = do
-  stateRef <- newState initState
-
-  registerFinalizer $ finalizer stateRef
-
-  (,,,,,) <$> registerVertex (StatefulVertex stateRef callback1)
-          <*> registerVertex (StatefulVertex stateRef callback2)
-          <*> registerVertex (StatefulVertex stateRef callback3)
-          <*> registerVertex (StatefulVertex stateRef callback4)
-          <*> registerVertex (StatefulVertex stateRef callback5)
-          <*> registerVertex (StatefulVertex stateRef callback6)
+statefulVertex :: (Eq i, Show i) => state -> (Timestamp -> i -> state -> Node state) -> (Timestamp -> state -> Node ()) -> Graph (Vertex i)
+statefulVertex zeroState onRecv onNotify =
+  vertex (empty :: Map Timestamp state)
+    (\t i stateMap -> do
+      state' <- onRecv t i (Data.Map.Strict.findWithDefault zeroState t stateMap)
+      return $ Data.Map.Strict.insert t state' stateMap
+    ) (\t stateMap -> do
+      onNotify t (Data.Map.Strict.findWithDefault zeroState t stateMap)
+      return $ Data.Map.Strict.delete t stateMap
+    )
